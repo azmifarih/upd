@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-upd - lihat dan update aplikasi yang TIDAK dikelola apt/snap.
+upd — list and update apps that apt and snap do not manage.
 
-Sumber yang didukung:
-  npm       paket global npm
-  bun       paket global bun
-  pipx      aplikasi Python lewat pipx
-  uv        tool Python lewat `uv tool`
-  cargo     binary hasil `cargo install`
-  flatpak   aplikasi flatpak
-  appimage  file .AppImage di folder umum (butuh pemetaan repo GitHub)
+Sources:
+  npm       global npm packages
+  bun       global bun packages
+  pipx      Python apps installed with pipx
+  uv        Python tools installed with `uv tool`
+  cargo     binaries from `cargo install`
+  flatpak   flatpak apps
+  appimage  .AppImage files in common folders
 
-Perintah:
-  upd scan                 tampilkan semua yang terpasang + versi terbaru
-  upd scan --outdated      hanya yang ada update
-  upd scan --json          keluaran mesin (untuk rutinitas/cron)
-  upd update [sumber...]   jalankan update (minta konfirmasi)
-  upd update --dry-run     tampilkan perintahnya saja
+Commands:
+  upd scan                 every installed app plus the latest version
+  upd scan --outdated      only apps with an update
+  upd scan --json          machine-readable output
+  upd update [sources...]  run updates (asks first)
+  upd update --dry-run     print the commands only
   upd appimage map FILE OWNER/REPO
-  upd sources              status tiap sumber
+  upd sources              status of each source
 
-Semua perintah `scan` bersifat baca-saja; hanya `update` yang mengubah sistem.
+Every `scan` command is read-only. Only `update` changes the system.
 """
 
 import argparse
@@ -108,7 +108,7 @@ SCRIPT_REGISTRY = [
      "manual": "curl -sS https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh"},
     {"name": "oh-my-zsh", "kind": "git", "path": "~/.oh-my-zsh",
      "repo": "robbyrussell/oh-my-zsh",
-     "update": ["git", "-C", "~/.oh-my-zsh", "pull", "--ff-only"]},
+     "update": ["git", "-C", "~/.oh-my-zsh", "pull", "--ff-only", "--autostash"]},
 ]
 
 
@@ -770,21 +770,28 @@ def auto_launchers(known_names, exclude_npm=()):
             npm = meta.get("npm") or ""
             if npm and npm in exclude_npm:
                 continue  # sudah dicatat sebagai paket npm global di prefix lain
-            current = meta.get("version") or detect_version([str(target), "--version"], f.name)
-            npm = meta.get("npm") or ""
-            if not npm and meta.get("repo"):
-                npm = ""
-            update = []
-            if meta["kind"] == "managed":
-                rc, _, _ = sh([str(target), "update", "--help"], timeout=6)
-                if rc == 0:
-                    update = [f.name, "update"]
-            found[f.name] = {
-                "name": f.name, "kind": "tool", "repo": meta.get("repo") or "",
-                "npm": npm, "current": current, "upgrade": update,
-                "tag_strip": ["v"], "path": str(f), "note": meta["kind"],
-            }
-    return list(found.values())
+            found[f.name] = (f, target, meta)
+
+    def finish(cand):
+        f, target, meta = cand
+        current = meta.get("version") or detect_version([str(target), "--version"], f.name)
+        npm = meta.get("npm") or ""
+        update = []
+        if meta["kind"] == "managed":
+            rc, _, _ = sh([str(target), "update", "--help"], timeout=6)
+            if rc == 0:
+                update = [f.name, "update"]
+        return {
+            "name": f.name, "kind": "tool", "repo": meta.get("repo") or "",
+            "npm": npm, "current": current, "upgrade": update,
+            "tag_strip": ["v"], "path": str(f), "note": meta["kind"],
+        }
+
+    cands = list(found.values())
+    if not cands:
+        return []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        return list(pool.map(finish, cands))
 
 
 def script_entries():
@@ -1122,53 +1129,67 @@ MANUAL_REPOS = {
 
 
 def script_scan(exclude_npm=()):
-    items = []
+    specs = []
     for e in script_entries():
         raw_path = str(expand_path(e.get("path") or ""))
         if not raw_path or not Path(raw_path).exists():
             continue
+        specs.append((e, raw_path))
+
+    def from_entry(spec):
+        e, raw_path = spec
         kind = e.get("kind", "tool")
         if kind == "git":
             rc, out, _ = sh(["git", "-C", raw_path, "rev-parse", "--short=7", "HEAD"], timeout=20)
             current = out.strip() if rc == 0 else "?"
             upgrade = [c.replace("~", str(HOME), 1) if c.startswith("~/") else c
                        for c in (e.get("update") or [])]
-            items.append({
+            return {
                 "name": e["name"], "kind": "git", "repo": e["repo"],
                 "current": current, "upgrade": upgrade,
                 "note": "commit", "path": raw_path,
-            })
-            continue
-
+            }
         cmd = e.get("version_cmd") or [e["name"], "--version"]
         current = detect_version(cmd, e["name"], raw_path)
         if current in ("?", "dev"):
             current = remembered_version(raw_path) or current
-        items.append({
+        return {
             "name": e["name"], "kind": "tool", "repo": e["repo"],
             "current": current, "upgrade": list(e.get("update") or []),
             "tag_strip": e.get("tag_strip") or ["v"], "npm": e.get("npm") or "",
             "note": e.get("manual") or "", "path": raw_path,
-        })
+        }
 
-    # launcher script yang punya metadata (managed install / package.json)
-    known_names = {i["name"] for i in items}
-    for it in auto_launchers(known_names, exclude_npm):
-        items.append(it)
+    known_names = {e["name"] for e, _ in specs}
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(specs) + 1))) as pool:
+        futs = [pool.submit(from_entry, spec) for spec in specs]
+        extra_fut = pool.submit(auto_launchers, known_names, exclude_npm)
+        items = [fut.result() for fut in futs]
+        extras = extra_fut.result()
+    items.extend(extras)
 
     # binary manual yang sumbernya bisa ditebak dari nama (helm, kind, flux, ...)
     known = {i["name"] for i in items}
+    manuals = []
     for name, path in sorted(all_manual().items()):
         info = repo_for(name)
         if name in known or not info:
             continue
+        manuals.append((name, path, info))
+
+    def from_manual(spec):
+        name, path, info = spec
         repo, strip = info
-        items.append({
+        return {
             "name": name, "kind": "tool", "repo": repo,
             "current": _manual_version(name, path),
             "upgrade": [], "tag_strip": list(strip),
             "note": f"manual: {path}", "path": str(path),
-        })
+        }
+
+    if manuals:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            items.extend(pool.map(from_manual, manuals))
     return items
 
 
@@ -1411,28 +1432,28 @@ def install_github_binary(repo, latest, target, dry_run=False):
     else:
         asset = pick_asset(assets, tools)
         if not asset:
-            return False, "tidak ada asset linux/amd64 di rilis ini"
+            return False, "no linux/amd64 asset in this release"
         name = asset.get("name") or ""
 
     if dry_run:
         if os.access(target.parent, os.W_OK):
             note = ""
         else:
-            note = "  [via sudo]" if sudo_available() else "  [butuh sudo]"
+            note = "  [via sudo]" if sudo_available() else "  [needs sudo]"
         return True, f"{name} -> {target}{note}"
 
     try:
         data = download(asset.get("browser_download_url") or "")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-        return False, f"unduh gagal: {exc}"
+        return False, f"download failed: {exc}"
 
     payload = extract_binary(data, name, tools)
     if not payload:
-        return False, f"binary {'/'.join(tools)} tidak ditemukan di dalam {name}"
+        return False, f"binary {'/'.join(tools)} not found inside {name}"
     if not payload.startswith(b"\x7fELF"):
-        return False, f"{name} bukan binary ELF linux"
+        return False, f"{name} is not a Linux ELF binary"
     if len(payload) < 100_000:
-        return False, f"ukuran mencurigakan ({len(payload)} byte)"
+        return False, f"suspicious size ({len(payload)} byte)"
 
     backup = None
     if target.exists():
@@ -1441,7 +1462,7 @@ def install_github_binary(repo, latest, target, dry_run=False):
         try:
             shutil.copy2(target, backup)
         except OSError as exc:
-            return False, f"gagal backup: {exc}"
+            return False, f"backup failed: {exc}"
 
     tmp = target.with_name(f".{target.name}.upd-tmp")
     try:
@@ -1451,19 +1472,19 @@ def install_github_binary(repo, latest, target, dry_run=False):
     except PermissionError:
         tmp.unlink(missing_ok=True)
         if not sudo_available():
-            return False, f"tidak punya izin menulis {target} (jalankan dengan sudo penuh: sudo {sys.argv[0]})"
+            return False, f"cannot write {target} (run with full sudo: sudo {sys.argv[0]})"
         ok_sudo, msg = sudo_install(payload, target)
         if not ok_sudo:
-            return False, f"sudo gagal menulis {target}: {msg}"
+            return False, f"sudo failed to write {target}: {msg}"
     except OSError as exc:
         tmp.unlink(missing_ok=True)
-        return False, f"gagal menulis: {exc}"
+        return False, f"write failed: {exc}"
 
     if not binary_runs(target):
         if backup and backup.exists():
             shutil.copy2(backup, target)
-            return False, "binary baru gagal dijalankan, versi lama dikembalikan"
-        return False, "binary baru gagal dijalankan"
+            return False, "new binary failed to run; old version restored"
+        return False, "new binary failed to run"
     remember_version(target, latest or tag)
     return True, f"{target} -> {tag}"
 
@@ -1474,9 +1495,9 @@ def install_appimage(target, url, sha512, latest, dry_run=False):
     """Unduh AppImage baru, verifikasi, lalu timpa file lama (nama file dipertahankan)."""
     target = expand_path(target)
     if not url:
-        return False, "rilis ini tidak punya asset .AppImage"
+        return False, "this release has no .AppImage asset"
     if dry_run:
-        return True, f"{latest} -> {target} (nama file dipertahankan)"
+        return True, f"{latest} -> {target} (filename kept)"
 
     tmpdir = CACHE_DIR / "tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1485,16 +1506,16 @@ def install_appimage(target, url, sha512, latest, dry_run=False):
         download_to(url, tmp)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
         tmp.unlink(missing_ok=True)
-        return False, f"unduh gagal: {exc}"
+        return False, f"download failed: {exc}"
 
     try:
         if not verify_sha512(tmp, sha512):
-            return False, "sha512 tidak cocok dengan feed — dibatalkan"
+            return False, "sha512 does not match the feed; aborted"
         with open(tmp, "rb") as fh:
             if fh.read(4) != b"\x7fELF":
-                return False, "file unduhan bukan ELF/AppImage"
+                return False, "download is not an ELF/AppImage"
         if tmp.stat().st_size < 1_000_000:
-            return False, f"ukuran mencurigakan ({tmp.stat().st_size} byte)"
+            return False, f"suspicious size ({tmp.stat().st_size} byte)"
 
         backup = None
         if target.exists():
@@ -1507,22 +1528,22 @@ def install_appimage(target, url, sha512, latest, dry_run=False):
             os.replace(tmp, target)
         except PermissionError:
             if not sudo_available():
-                return False, f"tidak punya izin menulis {target}"
+                return False, f"cannot write {target}"
             ok_sudo, msg = sudo_install_file(tmp, target)
             if not ok_sudo:
-                return False, f"sudo gagal menulis {target}: {msg}"
+                return False, f"sudo failed to write {target}: {msg}"
         except OSError as exc:
-            return False, f"gagal menulis: {exc}"
+            return False, f"write failed: {exc}"
 
         got = (appimage_meta(target) or {}).get("version")
         if not sha512 and latest and got and parse_version(got) != parse_version(latest):
             if backup and backup.exists():
                 shutil.copy2(backup, target)
-                return False, f"isi AppImage {got} bukan {latest}, versi lama dikembalikan"
+                return False, f"AppImage content is {got}, not {latest}; old version restored"
         remember_version(target, latest or got or "")
         return True, f"{target} -> {latest or got}"
     except OSError as exc:
-        return False, f"gagal memasang: {exc}"
+        return False, f"install failed: {exc}"
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1534,7 +1555,7 @@ def install_asdf(plugin, version, dry_run=False):
     rc, out, err = sh(["asdf", "install", plugin, str(version)], timeout=1800)
     if rc != 0:
         tail = (err or out).strip().splitlines()
-        return False, tail[-1][:200] if tail else f"asdf install gagal ({rc})"
+        return False, tail[-1][:200] if tail else f"asdf install failed ({rc})"
     sh(["asdf", "global", plugin, str(version)], timeout=60)
     sh(["asdf", "reshim", plugin, str(version)], timeout=60)
 
@@ -1552,7 +1573,7 @@ def install_asdf(plugin, version, dry_run=False):
             break
     if now and parse_version(now) == parse_version(str(version)):
         return True, f"{plugin} {version}"
-    return False, f"{plugin} terpasang tapi versi aktif masih {now or '?'}"
+    return False, f"{plugin} installed, but the active version is still {now or '?'}"
 
 
 OLLAMA_ARCHIVE = ("https://github.com/ollama/ollama/releases/latest/download/"
@@ -1562,9 +1583,9 @@ OLLAMA_ARCHIVE = ("https://github.com/ollama/ollama/releases/latest/download/"
 def install_ollama(latest, dry_run=False):
     """Pasang ulang binary + library ollama dari arsip rilis resmi (tanpa skrip installer)."""
     if dry_run:
-        return True, "unduh ollama-linux-amd64.tar.zst (~1,5 GB), pasang bin/ollama + lib/ollama"
+        return True, "download ollama-linux-amd64.tar.zst (~1.5 GB), install bin/ollama + lib/ollama"
     if not sudo_available():
-        return False, "butuh sudo tanpa password"
+        return False, "needs passwordless sudo"
 
     tmpdir = CACHE_DIR / "tmp" / "ollama"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1572,26 +1593,26 @@ def install_ollama(latest, dry_run=False):
     try:
         download_to(OLLAMA_ARCHIVE, arc, timeout=1800)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
-        return False, f"unduh gagal: {exc}"
+        return False, f"download failed: {exc}"
 
     try:
         rc, out, err = sh(["tar", "--zstd", "-xf", str(arc), "-C", str(tmpdir)], timeout=900)
         if rc != 0:
-            return False, f"ekstrak gagal: {(err or out).strip()[:160]}"
+            return False, f"extract failed: {(err or out).strip()[:160]}"
 
         src_bin = tmpdir / "bin" / "ollama"
         if not src_bin.is_file():
-            return False, "arsip tidak berisi bin/ollama"
+            return False, "archive does not contain bin/ollama"
         ok, msg = sudo_install_file(src_bin, Path("/usr/local/bin/ollama"))
         if not ok:
-            return False, f"sudo gagal menulis /usr/local/bin/ollama: {msg}"
+            return False, f"sudo failed to write /usr/local/bin/ollama: {msg}"
 
         src_lib = tmpdir / "lib" / "ollama"
         if src_lib.is_dir():
             rc, out, err = sh(["sudo", "-n", "cp", "-a", f"{src_lib}/.",
                                "/usr/local/lib/ollama/"], timeout=600)
             if rc != 0:
-                return False, f"gagal menyalin lib: {(err or out).strip()[:160]}"
+                return False, f"failed to copy lib: {(err or out).strip()[:160]}"
 
         rc, state, _ = sh(["systemctl", "is-active", "ollama"], timeout=15)
         if state.strip() == "active":
@@ -1600,7 +1621,7 @@ def install_ollama(latest, dry_run=False):
         now = detect_version(["ollama", "--version"], "ollama")
         if latest and parse_version(now):
             if parse_version(now) != parse_version(str(latest)):
-                return False, f"versi terpasang masih {now}"
+                return False, f"installed version is still {now}"
         return True, f"ollama {now}"
     finally:
         arc.unlink(missing_ok=True)
@@ -1608,18 +1629,80 @@ def install_ollama(latest, dry_run=False):
         shutil.rmtree(tmpdir / "lib", ignore_errors=True)
 
 
+def git_pull_ff(path):
+    """pull --ff-only. File skip-worktree (tema yang dikunci) disimpan lalu dikembalikan."""
+    path = str(path)
+    rc, listing, err = sh(["git", "-C", path, "ls-files", "-v"], timeout=30)
+    if rc != 0:
+        return False, (err or "not a git repo").strip().splitlines()[-1][:200]
+    pinned = []
+    for line in listing.splitlines():
+        if line[:1] in ("S", "s") and len(line) > 2:
+            pinned.append(line[2:])
+    rc, dirty, _ = sh(["git", "-C", path, "diff", "--name-only", "HEAD"], timeout=30)
+    changed = [n for n in (dirty or "").splitlines() if n and n not in pinned]
+    keep = pinned + changed
+    backups = []
+    tmp = tempfile.TemporaryDirectory(prefix="upd-git-")
+    try:
+        for rel in keep:
+            src = Path(path) / rel
+            if not src.is_file():
+                continue
+            dest = Path(tmp.name) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            backups.append(rel)
+            if rel in pinned:
+                sh(["git", "-C", path, "update-index", "--no-skip-worktree", "--", rel], timeout=30)
+            sh(["git", "-C", path, "checkout", "--", rel], timeout=30)
+        rc, out, err = sh(["git", "-C", path, "pull", "--ff-only"], timeout=300)
+        text = ((err or "") + "\n" + (out or "")).strip()
+        for rel in backups:
+            src = Path(tmp.name) / rel
+            target = Path(path) / rel
+            if src.is_file():
+                shutil.copy2(src, target)
+            if rel in pinned:
+                sh(["git", "-C", path, "update-index", "--skip-worktree", "--", rel], timeout=30)
+        if rc != 0:
+            tail = text.splitlines()
+            return False, (tail[-1][:200] if tail else f"git pull failed ({rc})")
+        return True, "ok"
+    finally:
+        tmp.cleanup()
+
+
+def pipx_upgrade(name):
+    """pipx upgrade. Venv tanpa pip dipasang ulang, karena upgrade biasa tidak bisa."""
+    rc, out, err = sh(["pipx", "upgrade", name], timeout=1800)
+    text = ((out or "") + "\n" + (err or "")).strip()
+    broken = "No module named pip" in text or "failed" in text.lower()
+    if rc == 0 and not broken:
+        return True, "ok"
+    if "No module named pip" in text:
+        rc2, out2, err2 = sh(["pipx", "reinstall", name], timeout=1800)
+        text2 = ((out2 or "") + "\n" + (err2 or "")).strip()
+        if rc2 == 0 and "failed" not in text2.lower():
+            return True, "venv had no pip; reinstalled"
+        tail = text2.splitlines()
+        return False, (tail[-1][:200] if tail else "pipx reinstall failed")
+    tail = text.splitlines()
+    return False, (tail[-1][:200] if tail else f"exit {rc}")
+
+
 def describe_upgrade(cmd):
     if not cmd:
         return "manual"
     kind = cmd[0]
     if kind == "__gh__":
-        return f"unduh rilis GitHub {cmd[1]} -> {cmd[3]}"
+        return f"download GitHub release {cmd[1]} -> {cmd[3]}"
     if kind == "__appimage__":
-        return f"unduh AppImage {cmd[4]} -> {cmd[1]}"
+        return f"download AppImage {cmd[4]} -> {cmd[1]}"
     if kind == "__asdf__":
         return f"asdf install {cmd[1]} {cmd[2]} && asdf global {cmd[1]} {cmd[2]}"
     if kind == "__ollama__":
-        return "unduh arsip rilis ollama, pasang bin + lib"
+        return "download the ollama release archive and install bin + lib"
     if kind == "__sudo__":
         return "sudo " + " ".join(cmd[1:])
     return " ".join(cmd)
@@ -1628,7 +1711,7 @@ def describe_upgrade(cmd):
 def execute_upgrade(cmd, dry_run=False):
     """Jalankan satu rencana update; satu tempat untuk CLI dan GUI."""
     if not cmd:
-        return False, "tidak ada jalur otomatis"
+        return False, "no automatic path"
     kind = cmd[0]
     try:
         if kind == "__gh__":
@@ -1641,6 +1724,10 @@ def execute_upgrade(cmd, dry_run=False):
             return install_ollama(cmd[1], dry_run=dry_run)
         if dry_run:
             return True, describe_upgrade(cmd)
+        if cmd[:2] == ["pipx", "upgrade"] and len(cmd) >= 3:
+            return pipx_upgrade(cmd[2])
+        if cmd[:1] == ["git"] and "pull" in cmd and "-C" in cmd:
+            return git_pull_ff(cmd[cmd.index("-C") + 1])
         if kind == "__sudo__":
             rc, out, err = sh(["sudo", "-n"] + list(cmd[1:]), timeout=1800)
         else:
@@ -1648,7 +1735,7 @@ def execute_upgrade(cmd, dry_run=False):
         if rc == 0:
             return True, "ok"
         tail = (err or out).strip().splitlines()
-        return False, (tail[-1][:200] if tail else f"kode {rc}")
+        return False, (tail[-1][:200] if tail else f"exit {rc}")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
         return False, str(exc)
 
@@ -1724,11 +1811,11 @@ def stale_items():
     for it in appimage_scan():
         if it.get("stale"):
             items.append({"kind": "appimage", "path": Path(it["path"]),
-                          "label": f"{it['display']} {it['current']} (versi lama)"})
+                          "label": f"{it['display']} {it['current']} (old version)"})
     for r in openbot_runtimes():
         for p in r.get("stale_paths") or []:
             items.append({"kind": "runtime", "path": Path(p),
-                          "label": f"runtime OpenBot {r['name']} {Path(p).name} (versi lama)"})
+                          "label": f"OpenBot runtime {r['name']} {Path(p).name} (old version)"})
     return items
 
 
@@ -1736,9 +1823,9 @@ def cmd_clean(args):
     if getattr(args, "stale", False):
         items = stale_items()
         if not items:
-            print("Tidak ada versi lama yang tersisa.")
+            print("No old versions left.")
             return 0
-        print(f"{len(items)} sisa versi lama:")
+        print(f"{len(items)} old versions:")
         for it in items:
             size = sh(["du", "-sh", str(it["path"])], timeout=60)[1].split("\t")[0]
             print(f"  {size:>6}  {it['label']}\n          {it['path']}")
@@ -1746,11 +1833,11 @@ def cmd_clean(args):
             return 0
         if not args.yes:
             try:
-                ans = input("\nPindahkan ke Trash? [y/N] ").strip().lower()
+                ans = input("\nMove to Trash? [y/N] ").strip().lower()
             except EOFError:
                 ans = "n"
             if ans not in ("y", "ya", "yes"):
-                print("Dibatalkan.")
+                print("Cancelled.")
                 return 1
         for it in items:
             dest = trash_file(it["path"])
@@ -1759,23 +1846,23 @@ def cmd_clean(args):
 
     orphans = orphan_desktop_entries(dry_run=True, filters=args.filter or None)
     if not orphans:
-        print("Tidak ada entri launcher yatim.")
+        print("No orphaned launcher entries.")
         return 0
-    print(f"{len(orphans)} entri launcher menunjuk file yang sudah hilang:")
+    print(f"{len(orphans)} launcher entries point at missing files:")
     for f in orphans:
         print(f"  {f}")
     if args.dry_run:
         return 0
     if not args.yes:
         try:
-            ans = input("\nPindahkan ke Trash? [y/N] ").strip().lower()
+            ans = input("\nMove to Trash? [y/N] ").strip().lower()
         except EOFError:
             ans = "n"
         if ans not in ("y", "ya", "yes"):
-            print("Dibatalkan.")
+            print("Cancelled.")
             return 1
     moved = orphan_desktop_entries(dry_run=False, filters=args.filter or None)
-    print(f"{len(moved)} file dipindah ke Trash, cache menu diperbarui.")
+    print(f"{len(moved)} files moved to Trash; menu cache refreshed.")
     for m in moved:
         print(f"  {m}")
     return 0
@@ -1852,23 +1939,23 @@ def cmd_uninstall(args):
 
     if not hits:
         import difflib
-        print(f"Tidak ditemukan: {spec}")
+        print(f"Not found: {spec}")
         semua = [f"{s}:{n}" for s, names in idx.items() for n in names]
         dekat = difflib.get_close_matches(spec, [n for n in semua], n=5, cutoff=0.6)
         if not dekat:
             dekat = [x for x in semua if spec.lower() in x.lower()][:5]
         if dekat:
-            print("Mungkin maksudmu: " + ", ".join(dekat))
+            print("Did you mean: " + ", ".join(dekat))
         return 1
 
     if len(hits) > 1:
-        print(f"'{spec}' ada di beberapa sumber: " + ", ".join(f"{s}:{n}" for s, n in hits))
-        print("Ulangi dengan format sumber:nama, contoh: " + f"{hits[0][0]}:{hits[0][1]}")
+        print(f"'{spec}' is in more than one source: " + ", ".join(f"{s}:{n}" for s, n in hits))
+        print("Use source:name, for example: " + f"{hits[0][0]}:{hits[0][1]}")
         return 2
 
     src, name = hits[0]
     if name in PROTECTED and not args.force:
-        print(f"{name} dipakai upd sendiri. Pakai --force kalau benar-benar mau menghapus.")
+        print(f"{name} is used by upd. Pass --force to remove it anyway.")
         return 2
 
     plan, note = [], ""
@@ -1877,21 +1964,21 @@ def cmd_uninstall(args):
     elif src == "appimage":
         path = next((p for p in appimage_scan() if p["name"] == name), None)
         if not path:
-            print("File AppImage tidak ditemukan.")
+            print("AppImage file not found.")
             return 1
-        note = f"file akan dipindah ke Trash: {path['path']}"
+        note = f"file will be moved to Trash: {path['path']}"
         plan = [["trash", path["path"]]]
     else:
         target = all_manual().get(name)
         if not target:
-            print(f"{src}:{name} tidak ditemukan di disk.")
+            print(f"{src}:{name} was not found on disk.")
             return 1
-        note = f"file dipindah ke Trash (bisa dikembalikan): {target}"
+        note = f"file will be moved to Trash (you can restore it): {target}"
         plan = [["trash", str(target)]]
 
-    print(f"Akan menghapus {src}:{name}")
+    print(f"Will remove {src}:{name}")
     for cmd in plan:
-        print("  $ " + " ".join(cmd) if cmd[0] != "trash" else f"  (pindah ke Trash) {cmd[1]}")
+        print("  $ " + " ".join(cmd) if cmd[0] != "trash" else f"  (move to Trash) {cmd[1]}")
     if note:
         print(f"  {note}")
 
@@ -1899,28 +1986,28 @@ def cmd_uninstall(args):
         return 0
     if not args.yes:
         try:
-            ans = input("\nLanjut? [y/N] ").strip().lower()
+            ans = input("\nContinue? [y/N] ").strip().lower()
         except EOFError:
             ans = "n"
         if ans not in ("y", "ya", "yes"):
-            print("Dibatalkan.")
+            print("Cancelled.")
             return 1
 
     cmd = plan[0]
     if cmd[0] == "trash":
         gone = Path(cmd[1])
         dest = trash_file(gone)
-        print(f"Dipindah ke Trash: {dest}")
+        print(f"Moved to Trash: {dest}")
         sisa = orphan_desktop_entries(existing_targets=[gone], dry_run=False)
         for f in sisa:
-            print(f"  launcher ikut dibersihkan: {f}")
+            print(f"  launcher removed too: {f}")
         return 0
 
     rc, out, err = sh(cmd, timeout=600)
     if rc == 0:
-        print(f"{GREEN}ok{RESET} — {src}:{name} dihapus")
+        print(f"{GREEN}ok{RESET} — {src}:{name} removed")
         return 0
-    print(f"{RED}gagal{RESET} ({rc})")
+    print(f"{RED}failed{RESET} ({rc})")
     for line in (err or out).strip().splitlines()[-3:]:
         print("  " + line[:160])
     return 2
@@ -1954,206 +2041,194 @@ def source_available(src):
     return False
 
 
-def collect(only=None, with_latest=True):
-    only = only or SOURCES
-    rows = []
-
-    def add(src, name, current, latest=None, has_update=None, upgrade=None, note="", url="", target="", repo=""):
-        if has_update is None:
-            has_update = is_newer(latest, current) if latest else False
-        rows.append({
-            "source": src, "name": name, "current": current,
-            "latest": latest or "?", "has_update": bool(has_update),
-            "upgrade": upgrade or [], "note": note, "url": url,
-            "target": target, "repo": repo,
-        })
-
-    tasks = {}
-
-    if "npm" in only and source_available("npm"):
-        items = npm_installed()
-        tasks["npm"] = (items, npm_latest)
-    if "bun" in only and source_available("bun"):
-        items = bun_installed()
-        tasks["bun"] = (items, npm_latest)
-    if "pipx" in only and source_available("pipx"):
-        items = pipx_installed()
-        tasks["pipx"] = (items, pypi_latest)
-    if "uv" in only and source_available("uv"):
-        items = uv_installed()
-        tasks["uv"] = (items, pypi_latest)
-    if "cargo" in only and source_available("cargo"):
-        items = cargo_installed()
-        tasks["cargo"] = (items, crates_latest)
-
-    # cek versi terbaru secara paralel
-    futures = {}
-    latest_map = {}
-    if with_latest:
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            for src, (items, fn) in tasks.items():
-                for it in items:
-                    futures[(src, it["name"])] = pool.submit(fn, it["name"])
-
-            for key, fut in futures.items():
-                try:
-                    latest_map[key] = fut.result()
-                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError):
-                    latest_map[key] = None
-
-    upg = {
-        "npm": lambda n: ["npm", "install", "-g", f"{n}@latest"],
-        "bun": lambda n: ["bun", "add", "-g", n],
-        "pipx": lambda n: ["pipx", "upgrade", n],
-        "uv": lambda n: ["uv", "tool", "upgrade", n],
-        "cargo": lambda n: ["cargo", "install", "--force", n],
+def _row(src, name, current, latest=None, has_update=None, upgrade=None, note="", url="", target="", repo=""):
+    if has_update is None:
+        has_update = is_newer(latest, current) if latest else False
+    return {
+        "source": src, "name": name, "current": current,
+        "latest": latest or "?", "has_update": bool(has_update),
+        "upgrade": upgrade or [], "note": note, "url": url,
+        "target": target, "repo": repo,
     }
-    for src, (items, _) in tasks.items():
-        for it in items:
-            latest = latest_map.get((src, it["name"]))
-            add(src, it["name"], it["current"], latest, upgrade=upg[src](it["name"]))
 
-    # npm global di prefix lain (/usr/local, /usr): tidak terlihat `npm ls -g` user
-    other_npm = npm_other_installed() if source_available("npm") else []
-    if other_npm and "npm" in only:
+
+def _await_map(futures, rate_limit=False):
+    """Tunggu permintaan versi. Satu kegagalan tidak menggagalkan yang lain."""
+    out = {}
+    for key, fut in futures.items():
+        try:
+            out[key] = fut.result()
+        except urllib.error.HTTPError as exc:
+            out[key] = RATE_LIMIT if rate_limit and exc.code in (403, 429) else None
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+            out[key] = None
+        except Exception:
+            out[key] = None
+    return out
+
+
+def collect(only=None, with_latest=True):
+    only = list(only or SOURCES)
+    # Sekali saja: kalau ini dipanggil dari banyak thread, masing-masing menjalankan `gh auth token`.
+    if with_latest:
+        github_token()
+    http = ThreadPoolExecutor(max_workers=24) if with_latest else None
+    other_npm = npm_other_installed() if source_available("npm") and ("npm" in only or "script" in only) else []
+
+    def rows_npm():
+        out = []
+        items = npm_installed() if source_available("npm") else []
+        futs = {}
+        if http is not None:
+            for it in items:
+                futs[("user", it["name"])] = http.submit(npm_latest, it["name"])
+            for it in other_npm:
+                futs[("other", it["name"])] = http.submit(npm_latest, it["name"])
+        latest = _await_map(futs)
+        for it in items:
+            out.append(_row("npm", it["name"], it["current"], latest.get(("user", it["name"])),
+                            upgrade=["npm", "install", "-g", f"{it['name']}@latest"]))
         npm_exe = shutil.which("npm") or "npm"
-        if with_latest:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                latest_other = dict(zip([i["name"] for i in other_npm],
-                                        pool.map(lambda i: npm_latest(i["name"]), other_npm)))
-        else:
-            latest_other = {}
         for it in other_npm:
             root = Path(it["prefix"]) / "lib" / "node_modules"
             cmd = [npm_exe, "install", "-g", "--prefix", it["prefix"], f"{it['name']}@latest"]
             if not os.access(root, os.W_OK):
                 cmd = ["__sudo__"] + cmd
             bins = f" · bin: {', '.join(it['bins'])}" if it["bins"] else ""
-            add("npm", it["name"], it["current"], latest_other.get(it["name"]),
-                upgrade=cmd, note=f"global {it['prefix']}{bins}")
+            out.append(_row("npm", it["name"], it["current"], latest.get(("other", it["name"])),
+                            upgrade=cmd, note=f"global {it['prefix']}{bins}"))
+        return out
 
-    if "flatpak" in only and source_available("flatpak"):
-        for it in (flatpak_updates() if with_latest else
-                   [{"name": k, "current": v, "latest": v, "has_update": False}
-                    for k, v in flatpak_current().items()]):
-            add("flatpak", it["name"], it["current"], it["latest"], it["has_update"],
-                upgrade=["flatpak", "update", "-y", it["name"]])
+    def rows_registry(src, installed, latest_fn, upgrade_fn):
+        items = installed() if source_available(src) else []
+        futs = {}
+        if http is not None:
+            for it in items:
+                futs[it["name"]] = http.submit(latest_fn, it["name"])
+        latest = _await_map(futs)
+        return [_row(src, it["name"], it["current"], latest.get(it["name"]),
+                     upgrade=upgrade_fn(it["name"])) for it in items]
 
-    if "appimage" in only:
-        apps = appimage_scan()
+    def rows_flatpak():
         if with_latest:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                remotes = list(pool.map(appimage_latest, apps))
+            items = flatpak_updates()
         else:
-            remotes = [None] * len(apps)
-        for it, remote in zip(apps, remotes):
-            latest = remote[0] if remote else None
-            url = remote[1] if remote else None
-            sha = remote[2] if remote else None
+            items = [{"name": k, "current": v, "latest": v, "has_update": False}
+                     for k, v in flatpak_current().items()]
+        return [_row("flatpak", it["name"], it["current"], it["latest"], it["has_update"],
+                     upgrade=["flatpak", "update", "-y", it["name"]]) for it in items]
+
+    def rows_appimage():
+        apps = appimage_scan()
+        futs = {}
+        if http is not None:
+            for i, it in enumerate(apps):
+                futs[i] = http.submit(appimage_latest, it)
+        remote = _await_map(futs)
+        out = []
+        for i, it in enumerate(apps):
+            got = remote.get(i)
+            latest = got[0] if got else None
+            url = got[1] if got else None
+            sha = got[2] if got else None
             upgrade = ["__appimage__", it["path"], url, sha or "", latest] if (url and latest) else []
             if it.get("repo"):
                 origin = f"github:{it['repo']}"
             elif it.get("feed"):
                 origin = f"feed:{it['feed']}"
             else:
-                origin = "tanpa metadata updater"
+                origin = "no updater metadata"
             if it.get("stale"):
-                note = f"{origin} · versi lama, aman dibersihkan: upd clean --stale"
+                note = f"{origin} · old version, safe to remove: upd clean --stale"
             else:
                 note = origin
-            add("appimage", it["name"], it["current"],
+            out.append(_row(
+                "appimage", it["name"], it["current"],
                 "-" if it.get("stale") else latest,
                 False if it.get("stale") else None,
                 upgrade=[] if it.get("stale") else upgrade,
-                note=note, target=it["path"], repo=it.get("repo") or "")
+                note=note, target=it["path"], repo=it.get("repo") or "",
+            ))
+        return out
 
-    if "asdf" in only and source_available("asdf"):
-        items = asdf_installed()
-        if with_latest:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                latest_map_a = dict(zip([i["name"] for i in items],
-                                        pool.map(lambda i: asdf_latest(i["name"]), items)))
-        else:
-            latest_map_a = {}
+    def rows_asdf():
+        items = asdf_installed() if source_available("asdf") else []
+        futs = {}
+        if http is not None:
+            for it in items:
+                futs[it["name"]] = http.submit(asdf_latest, it["name"])
+        latest = _await_map(futs)
+        out = []
         for it in items:
-            latest = latest_map_a.get(it["name"])
-            upgrade = ["__asdf__", it["name"], latest] if latest else []
-            add("asdf", it["name"], it["current"], latest, upgrade=upgrade,
-                note=f"asdf: versi aktif {it['current']}")
+            got = latest.get(it["name"])
+            out.append(_row("asdf", it["name"], it["current"], got,
+                            upgrade=["__asdf__", it["name"], got] if got else [],
+                            note=f"asdf: active version {it['current']}"))
+        return out
 
-    if "openbot" in only and source_available("openbot"):
-        runs = openbot_runtimes()
-        if runs:
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                latest_ob = {}
-                for r in runs:
-                    key = r["npm"] or r["name"]
-                    if r["npm"]:
-                        latest_ob[key] = pool.submit(npm_latest, r["npm"])
+    def rows_openbot():
+        runs = openbot_runtimes() if source_available("openbot") else []
+        futs = {}
+        if http is not None:
             for r in runs:
-                latest = None
-                fut = latest_ob.get(r["npm"] or r["name"])
-                if fut is not None:
-                    try:
-                        latest = fut.result()
-                    except Exception:
-                        latest = None
-                sisa = f" · {r['stale']} folder versi lama" if r.get("stale") else ""
-                if r["npm"]:
-                    add("openbot", r["name"], r["current"], latest,
-                        note=f"runtime OpenBot{sisa}")
-                else:
-                    add("openbot", r["name"], r["current"], "-", False,
-                        note=f"runtime OpenBot (dikelola OpenBot){sisa}")
+                if r.get("npm"):
+                    futs[r["name"]] = http.submit(npm_latest, r["npm"])
+        latest = _await_map(futs)
+        out = []
+        for r in runs:
+            sisa = f" · {r['stale']} old version folder(s)" if r.get("stale") else ""
+            # Runtime ini milik OpenBot. upd tidak memasangnya, jadi jangan
+            # tampilkan sebagai update yang tidak pernah hilang.
+            note = f"Managed by OpenBot{sisa}"
+            if r.get("npm") and latest.get(r["name"]) and is_newer(latest.get(r["name"]), r["current"]):
+                note = f"Managed by OpenBot · npm {latest.get(r['name'])}{sisa}"
+            out.append(_row("openbot", r["name"], r["current"], r["current"], False, note=note))
+        return out
 
-    if "script" in only:
-        exclude_npm = {i["name"] for i in other_npm}
+    def rows_script():
+        exclude = {i["name"] for i in other_npm}
         for i in other_npm:
-            exclude_npm.update(i.get("bins") or [])
-        entries = script_scan(exclude_npm)
-        remote = {}
-        if with_latest:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                futs = {}
-                for it in entries:
-                    if it["kind"] == "git":
-                        futs[it["name"]] = pool.submit(github_head_sha, it["repo"])
-                    elif it.get("npm"):
-                        futs[it["name"]] = pool.submit(npm_latest, it["npm"])
-                    else:
-                        futs[it["name"]] = pool.submit(github_latest_tag, it["repo"], tuple(it["tag_strip"]))
-                for key, fut in futs.items():
-                    try:
-                        remote[key] = fut.result()
-                    except urllib.error.HTTPError as exc:
-                        remote[key] = RATE_LIMIT if exc.code in (403, 429) else None
-                    except Exception:
-                        remote[key] = None
+            exclude.update(i.get("bins") or [])
+        entries = script_scan(exclude)
+        futs = {}
+        if http is not None:
+            for it in entries:
+                if it["kind"] == "git":
+                    futs[it["name"]] = http.submit(github_head_sha, it["repo"])
+                elif it.get("npm"):
+                    futs[it["name"]] = http.submit(npm_latest, it["npm"])
+                else:
+                    futs[it["name"]] = http.submit(
+                        github_latest_tag, it["repo"], tuple(it.get("tag_strip") or ["v"]))
+        remote = _await_map(futs, rate_limit=True)
+        out = []
         for it in entries:
-            latest = remote.get(it["name"])
-            if latest == RATE_LIMIT:
-                latest = None
-                it["note"] = "GitHub API rate limit — set GITHUB_TOKEN"
+            got = remote.get(it["name"])
+            note = it.get("note") or ""
+            if got == RATE_LIMIT:
+                got = None
+                note = "GitHub API rate limit — set GITHUB_TOKEN"
             if it["kind"] == "git":
-                has = bool(latest) and latest != it["current"]
-                add("script", it["name"], it["current"], latest or "?", has,
-                    upgrade=it["upgrade"], note="git")
+                has = bool(got) and got != it["current"]
+                out.append(_row("script", it["name"], it["current"], got or "?", has,
+                                upgrade=it["upgrade"], note="git"))
             else:
-                url = ""
-                if latest and it.get("repo"):
-                    url = f"https://github.com/{it['repo']}/releases/tag/v{latest}"
+                url = f"https://github.com/{it['repo']}/releases/tag/v{got}" if got and it.get("repo") else ""
                 up = list(it["upgrade"])
                 if up[:1] == ["__ollama__"]:
-                    up = ["__ollama__", latest] if latest else []
-                add("script", it["name"], it["current"], latest,
-                    upgrade=up, note=it["note"], url=url,
-                    target=it.get("path") or "", repo=it.get("repo") or "")
+                    up = ["__ollama__", got] if got else []
+                out.append(_row("script", it["name"], it["current"], got,
+                                upgrade=up, note=note, url=url,
+                                target=it.get("path") or "", repo=it.get("repo") or ""))
+        return out
 
-    if "binary" in only:
-        for b in load_binaries_cfg():
+    def rows_binary():
+        bins = load_binaries_cfg()
+
+        def one(b):
             cur = "?"
-            if b.get("version_cmd"):
-                rc, out, _ = sh(b["version_cmd"], timeout=30) if isinstance(b["version_cmd"], list) else (0, "", "")
+            if isinstance(b.get("version_cmd"), list):
+                _rc, out, _err = sh(b["version_cmd"], timeout=30)
                 cur = find_version(out) or "?"
             latest = None
             if b.get("latest_url"):
@@ -2162,8 +2237,53 @@ def collect(only=None, with_latest=True):
                     latest = find_version(json.dumps(data)) if isinstance(data, dict) else None
                 except Exception:
                     latest = None
-            add("binary", b.get("name", "?"), cur, latest, note=b.get("path", ""))
+            return _row("binary", b.get("name", "?"), cur, latest, note=b.get("path", ""))
 
+        if not bins:
+            return []
+        if http is not None and len(bins) > 1:
+            futs = [http.submit(one, b) for b in bins]
+            return [f.result() for f in futs]
+        return [one(b) for b in bins]
+
+    jobs = []
+    if "npm" in only and (source_available("npm") or other_npm):
+        jobs.append(rows_npm)
+    if "bun" in only and source_available("bun"):
+        jobs.append(lambda: rows_registry("bun", bun_installed, npm_latest, lambda n: ["bun", "add", "-g", n]))
+    if "pipx" in only and source_available("pipx"):
+        jobs.append(lambda: rows_registry("pipx", pipx_installed, pypi_latest, lambda n: ["pipx", "upgrade", n]))
+    if "uv" in only and source_available("uv"):
+        jobs.append(lambda: rows_registry("uv", uv_installed, pypi_latest, lambda n: ["uv", "tool", "upgrade", n]))
+    if "cargo" in only and source_available("cargo"):
+        jobs.append(lambda: rows_registry("cargo", cargo_installed, crates_latest,
+                                          lambda n: ["cargo", "install", "--force", n]))
+    if "flatpak" in only and source_available("flatpak"):
+        jobs.append(rows_flatpak)
+    if "appimage" in only:
+        jobs.append(rows_appimage)
+    if "asdf" in only and source_available("asdf"):
+        jobs.append(rows_asdf)
+    if "openbot" in only and source_available("openbot"):
+        jobs.append(rows_openbot)
+    if "script" in only:
+        jobs.append(rows_script)
+    if "binary" in only:
+        jobs.append(rows_binary)
+
+    parts = []
+    try:
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as inv:
+                futs = [inv.submit(fn) for fn in jobs]
+                for fut in futs:
+                    parts.append(fut.result())
+    finally:
+        if http is not None:
+            http.shutdown(wait=True)
+    rows = []
+    for part in parts:
+        rows.extend(part)
     return rows
 
 
@@ -2179,9 +2299,9 @@ RED = "\033[31m" if RESET else ""
 
 def print_table(rows):
     if not rows:
-        print("Tidak ada yang terdeteksi.")
+        print("Nothing detected.")
         return
-    cols = [("SUMBER", "source"), ("PAKET", "name"), ("KINI", "current"), ("TERBARU", "latest"), ("STATUS", "status")]
+    cols = [("SOURCE", "source"), ("NAME", "name"), ("CURRENT", "current"), ("LATEST", "latest"), ("STATUS", "status")]
     data = []
     for r in rows:
         status = "update" if r["has_update"] else ("ok" if r["latest"] != "?" else "?")
@@ -2215,10 +2335,10 @@ def summarize(rows):
     out = [r for r in rows if r["has_update"]]
     unknown = [r for r in rows if r["latest"] == "?"]
     print()
-    print(f"{len(rows)} aplikasi terpantau, {BOLD}{len(out)}{RESET} punya update" +
-          (f", {len(unknown)} versi terbaru tidak diketahui" if unknown else ""))
+    print(f"{len(rows)} apps tracked, {BOLD}{len(out)}{RESET} with an update" +
+          (f", {len(unknown)} latest versions unknown" if unknown else ""))
     if out:
-        print(f"Jalankan: {BOLD}upd update{RESET} untuk memasang semuanya")
+        print(f"Run: {BOLD}upd update{RESET} to install them")
 
 
 # --------------------------------------------------------------------------- update
@@ -2227,12 +2347,12 @@ def run_updates(rows, assume_yes=False, dry_run=False):
     todo = [r for r in rows if r["has_update"] and r["upgrade"]]
     skipped = [r for r in rows if r["has_update"] and not r["upgrade"]]
     if not todo:
-        print("Tidak ada update yang bisa dijalankan otomatis.")
+        print("No updates can run automatically.")
         if skipped:
-            print(f"{len(skipped)} item perlu tindakan manual (lihat kolom catatan).")
+            print(f"{len(skipped)} items need a manual step (see the note).")
         return 0
 
-    print(f"{len(todo)} update akan dijalankan:")
+    print(f"{len(todo)} updates will run:")
     for r in todo:
         print(f"  - {r['source']}:{r['name']}  {r['current']} -> {r['latest']}")
     if dry_run:
@@ -2240,9 +2360,9 @@ def run_updates(rows, assume_yes=False, dry_run=False):
         for r in todo:
             print(f"  $ {describe_upgrade(r['upgrade'])}")
         if skipped:
-            print(f"\n{DIM}Tidak bisa otomatis ({len(skipped)}):{RESET}")
+            print(f"\n{DIM}Cannot update automatically ({len(skipped)}):{RESET}")
             for r in skipped:
-                hint = r["note"] or "update manual"
+                hint = r["note"] or "manual update"
                 print(f"  - {r['source']}:{r['name']}  {r['current']} -> {r['latest']}  {DIM}{hint}{RESET}")
                 if r.get("url"):
                     print(f"    {DIM}{r['url']}{RESET}")
@@ -2250,11 +2370,11 @@ def run_updates(rows, assume_yes=False, dry_run=False):
 
     if not assume_yes:
         try:
-            ans = input("\nLanjut? [y/N] ").strip().lower()
+            ans = input("\nContinue? [y/N] ").strip().lower()
         except EOFError:
             ans = "n"
         if ans not in ("y", "ya", "yes"):
-            print("Dibatalkan.")
+            print("Cancelled.")
             return 1
 
     ok_count = fail = 0
@@ -2266,10 +2386,10 @@ def run_updates(rows, assume_yes=False, dry_run=False):
             print(f"    {GREEN}ok{RESET} — {msg}")
         else:
             fail += 1
-            print(f"    {RED}gagal{RESET} — {msg}")
-    print(f"\nSelesai: {ok_count} berhasil, {fail} gagal.")
+            print(f"    {RED}failed{RESET} — {msg}")
+    print(f"\nDone: {ok_count} succeeded, {fail} failed.")
     if skipped:
-        print(f"\n{DIM}Tidak bisa otomatis ({len(skipped)}):{RESET}")
+        print(f"\n{DIM}Cannot update automatically ({len(skipped)}):{RESET}")
         for r in skipped:
             print(f"  - {r['source']}:{r['name']}  {r['current']} -> {r['latest']}  {DIM}{r['note']}{RESET}")
             if r.get("url"):
@@ -2280,12 +2400,12 @@ def run_updates(rows, assume_yes=False, dry_run=False):
 # --------------------------------------------------------------------------- cli
 
 def cmd_sources(_args):
-    print(f"{BOLD}Status sumber{RESET}")
+    print(f"{BOLD}Source status{RESET}")
     for src in SOURCES:
         avail = source_available(src)
-        mark = GREEN + "ada" + RESET if avail else DIM + "-" + RESET
+        mark = GREEN + "yes" + RESET if avail else DIM + "-" + RESET
         print(f"  {src.ljust(10)} {mark}")
-    print(f"\nKonfigurasi: {CONFIG_DIR}")
+    print(f"\nConfig: {CONFIG_DIR}")
     return 0
 
 
@@ -2321,16 +2441,16 @@ def cmd_list(args):
         print(json.dumps({"count": len(rows), "rows": rows}, indent=2))
         return 0
     if not rows:
-        print("Tidak ada yang terdeteksi.")
+        print("Nothing detected.")
         return 0
 
-    widths = [len("SUMBER"), len("PAKET"), len("VERSI")]
+    widths = [len("SOURCE"), len("NAME"), len("VERSION")]
     for r in rows:
         widths[0] = max(widths[0], len(r["source"]))
         widths[1] = max(widths[1], len(r["name"]))
         widths[2] = max(widths[2], len(str(r["current"])))
 
-    print(f"{BOLD}{'SUMBER'.ljust(widths[0])}  {'PAKET'.ljust(widths[1])}  {'VERSI'.ljust(widths[2])}{RESET}")
+    print(f"{BOLD}{'SOURCE'.ljust(widths[0])}  {'NAME'.ljust(widths[1])}  {'VERSION'.ljust(widths[2])}{RESET}")
     print(DIM + "-" * (sum(widths) + 4) + RESET)
     for r in rows:
         print(f"{r['source'].ljust(widths[0])}  {r['name'].ljust(widths[1])}  {str(r['current']).ljust(widths[2])}")
@@ -2339,8 +2459,8 @@ def cmd_list(args):
     for r in rows:
         per[r["source"]] = per.get(r["source"], 0) + 1
     rincian = ", ".join(f"{k} {v}" for k, v in sorted(per.items()))
-    print(f"\n{BOLD}{len(rows)}{RESET} aplikasi terpasang ({rincian})")
-    print(f"{DIM}Untuk cek versi terbaru: upd scan{RESET}")
+    print(f"\n{BOLD}{len(rows)}{RESET} apps installed ({rincian})")
+    print(f"{DIM}To compare with the latest versions: upd scan{RESET}")
     return 0
 
 
@@ -2356,13 +2476,13 @@ def cmd_scan(args):
     summarize(rows)
     manual = [r for r in rows if r["has_update"] and not r["upgrade"] and r["note"]]
     if manual:
-        print(f"\n{DIM}Perlu tindakan manual:{RESET}")
+        print(f"\n{DIM}Needs a manual step:{RESET}")
         for r in manual:
             print(f"  - {r['source']}:{r['name']}  {r['current']} -> {r['latest']}  {DIM}{r['note']}{RESET}")
             if r.get("url"):
                 print(f"    {DIM}{r['url']}{RESET}")
-    if any(r["source"] == "appimage" and r["note"].startswith("tanpa metadata") for r in rows):
-        print(f"{DIM}AppImage tanpa metadata updater: `upd appimage map FILE OWNER/REPO`{RESET}")
+    if any(r["source"] == "appimage" and r["note"].startswith("no updater metadata") for r in rows):
+        print(f"{DIM}AppImage with no updater metadata: `upd appimage map FILE OWNER/REPO`{RESET}")
     return 0
 
 
@@ -2380,8 +2500,8 @@ def cmd_update(args):
         skipped_sudo = [r for r in rows if r["has_update"] and r["source"] not in keep]
         rows = [r for r in rows if r["source"] in keep]
         if skipped_sudo:
-            print(f"{len(skipped_sudo)} item dari paket manager dilewati saat sudo "
-                  f"(jalankan tanpa sudo untuk itu)")
+            print(f"{len(skipped_sudo)} package-manager items skipped under sudo "
+                  f"(run without sudo for those)")
 
     if getattr(args, "binaries", False):
         for r in rows:
@@ -2389,7 +2509,7 @@ def cmd_update(args):
                     and r.get("repo") and r.get("target")
                     and r["repo"] not in NO_BINARY_REPOS):
                 if not os.access(Path(r["target"]).parent, os.W_OK):
-                    r["note"] = (r["note"] + " [butuh sudo]").strip()
+                    r["note"] = (r["note"] + " [needs sudo]").strip()
                     continue
                 r["upgrade"] = ["__gh__", r["repo"], str(r["latest"]), r["target"]]
                 r["is_binary"] = True
@@ -2411,16 +2531,16 @@ def cmd_script(args):
         for e in entries:
             print(f"{e.get('name')}  {e.get('path')}  github:{e.get('repo')}")
         if not entries:
-            print("Belum ada tool tambahan. Pakai: upd script add NAME PATH OWNER/REPO")
+            print("No extra tools yet. Use: upd script add NAME PATH OWNER/REPO")
         return 0
 
     if args.action == "add":
         name, path, repo = args.name, args.path, args.value
         if not (name and path and repo):
-            print("Pakai: upd script add NAME PATH OWNER/REPO [--cmd 'tool --version']")
+            print("Use: upd script add NAME PATH OWNER/REPO [--cmd 'tool --version']")
             return 2
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
-            print("Repo harus OWNER/REPO, contoh: junegunn/fzf")
+            print("Repo must be OWNER/REPO, for example: junegunn/fzf")
             return 2
         entries = [e for e in entries if e.get("name") != name]
         entries.append({
@@ -2432,10 +2552,10 @@ def cmd_script(args):
             "update": args.update.split() if args.update else [],
         })
         SCRIPTS_CFG.write_text(json.dumps(entries, indent=2))
-        print(f"Ditambahkan: {name} -> github:{repo}")
+        print(f"Added: {name} -> github:{repo}")
         return 0
 
-    print("Pakai: upd script add NAME PATH OWNER/REPO | upd script list")
+    print("Use: upd script add NAME PATH OWNER/REPO | upd script list")
     return 2
 
 
@@ -2475,14 +2595,14 @@ def cmd_manual(args):
         return 0
 
     with_repo = [n for n in names if repo_for(n)]
-    print(f"{BOLD}Binary tanpa manajer paket{RESET} ({len(names)} ditemukan, {len(with_repo)} ada repo GitHub)\n")
+    print(f"{BOLD}Binaries outside a package manager{RESET} ({len(names)} found, {len(with_repo)} have a GitHub repo)\n")
     for n in names:
         repo = repo_for(n)
-        tag = f"github:{repo[0]}" if repo else DIM + "belum ada repo" + RESET
+        tag = f"github:{repo[0]}" if repo else DIM + "no repo yet" + RESET
         print(f"  {n.ljust(18)} {versions.get(n, '?').ljust(12)} {tag}")
     unknown = len(names) - len(with_repo)
     if unknown:
-        print(f"\n{DIM}{unknown} binary belum punya sumber versi. Daftarkan: "
+        print(f"\n{DIM}{unknown} binaries have no version source. Register them: "
               f"upd script add NAME PATH OWNER/REPO{RESET}")
     return 0
 
@@ -2493,88 +2613,88 @@ def cmd_appimage(args):
     if args.action == "map":
         target, repo = args.target, (args.value or "")
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
-            print("Format repo harus OWNER/REPO, contoh: traycerai/traycer")
+            print("Repo must be OWNER/REPO, for example: traycerai/traycer")
             return 2
         p = Path(target).expanduser()
         key = str(p) if p.exists() else target
         mapping[key] = repo
         APPIMAGE_MAP.write_text(json.dumps(mapping, indent=2))
-        print(f"Dipetakan: {key} -> {repo}")
+        print(f"Mapped: {key} -> {repo}")
         return 0
     if args.action == "list":
         for k, v in mapping.items():
             print(f"{k}  ->  {v}")
         if not mapping:
-            print("Belum ada pemetaan.")
+            print("No mappings yet.")
         return 0
-    print("Pakai: upd appimage map FILE OWNER/REPO | upd appimage list")
+    print("Use: upd appimage map FILE OWNER/REPO | upd appimage list")
     return 2
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="upd", description="Update aplikasi di luar apt/snap")
+    ap = argparse.ArgumentParser(prog="upd", description="Update apps outside apt and snap")
     sub = ap.add_subparsers(dest="cmd")
 
     ls = sub.add_parser("list", aliases=["ls"],
-                        help="daftar semua aplikasi terpasang, termasuk binary manual (offline)")
-    ls.add_argument("--only", help="sumber tertentu, pisahkan koma: npm,pipx")
-    ls.add_argument("--json", action="store_true", help="keluaran JSON")
+                        help="list installed apps, including manual binaries (offline)")
+    ls.add_argument("--only", help="sources, comma-separated: npm,pipx")
+    ls.add_argument("--json", action="store_true", help="JSON output")
     ls.set_defaults(func=cmd_list)
 
-    sc = sub.add_parser("scan", help="lihat semua aplikasi dan versi terbaru")
-    sc.add_argument("--only", help="sumber tertentu, pisahkan koma: npm,pipx")
-    sc.add_argument("--outdated", action="store_true", help="hanya yang ada update")
-    sc.add_argument("--json", action="store_true", help="keluaran JSON")
+    sc = sub.add_parser("scan", help="compare installed apps with the latest versions")
+    sc.add_argument("--only", help="sources, comma-separated: npm,pipx")
+    sc.add_argument("--outdated", action="store_true", help="only apps with an update")
+    sc.add_argument("--json", action="store_true", help="JSON output")
     sc.set_defaults(func=cmd_scan)
 
-    up = sub.add_parser("update", help="jalankan update")
-    up.add_argument("sources", nargs="?", help="sumber tertentu, pisahkan koma")
-    up.add_argument("--only", help="sama dengan argumen sumber")
-    up.add_argument("--yes", "-y", action="store_true", help="tanpa konfirmasi")
-    up.add_argument("--dry-run", action="store_true", help="tampilkan perintah saja")
+    up = sub.add_parser("update", help="install available updates")
+    up.add_argument("sources", nargs="?", help="sources, comma-separated")
+    up.add_argument("--only", help="same as the sources argument")
+    up.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    up.add_argument("--dry-run", action="store_true", help="print the commands only")
     up.add_argument("--binaries", action="store_true",
-                    help="ikut update binary GitHub (helm, kind, terraform, ...)")
+                    help="also update GitHub binaries (helm, kind, terraform, ...)")
     up.add_argument("--only-binaries", action="store_true",
-                    help="hanya binary GitHub, lewati paket manager")
+                    help="only GitHub binaries; skip package managers")
     up.add_argument("--pick", action="append", default=[],
-                    help="batasi ke sumber:nama tertentu (boleh berulang)")
+                    help="limit to source:name (repeatable)")
     up.set_defaults(func=cmd_update)
 
-    ai = sub.add_parser("appimage", help="kelola pemetaan AppImage -> repo GitHub")
+    ai = sub.add_parser("appimage", help="manage AppImage to GitHub repo mappings")
     ai.add_argument("action", choices=["map", "list"])
     ai.add_argument("target", nargs="?")
     ai.add_argument("value", nargs="?")
     ai.set_defaults(func=cmd_appimage)
 
-    sk = sub.add_parser("script", help="kelola tool hasil installer curl")
+    sk = sub.add_parser("script", help="manage tools installed by a curl installer")
     sk.add_argument("action", choices=["add", "list"])
     sk.add_argument("name", nargs="?")
     sk.add_argument("path", nargs="?")
     sk.add_argument("value", nargs="?", help="OWNER/REPO GitHub")
-    sk.add_argument("--cmd", help="perintah cek versi, mis. 'fzf --version'")
-    sk.add_argument("--update", help="perintah update, mis. 'fzf --version'")
+    sk.add_argument("--cmd", help="version command, e.g. 'fzf --version'")
+    sk.add_argument("--update", help="update command, e.g. 'fzf --version'")
     sk.set_defaults(func=cmd_script)
 
-    un = sub.add_parser("uninstall", aliases=["remove"], help="hapus aplikasi")
-    un.add_argument("target", help="nama, atau sumber:nama (mis. npm:cline)")
-    un.add_argument("--yes", "-y", action="store_true", help="tanpa konfirmasi")
-    un.add_argument("--dry-run", action="store_true", help="tampilkan rencana saja")
-    un.add_argument("--force", action="store_true", help="izinkan hapus tool inti")
+    un = sub.add_parser("uninstall", aliases=["remove"], help="remove an app")
+    un.add_argument("target", help="name, or source:name (e.g. npm:cline)")
+    un.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    un.add_argument("--dry-run", action="store_true", help="print the plan only")
+    un.add_argument("--force", action="store_true", help="allow removing a core tool")
     un.set_defaults(func=cmd_uninstall)
 
-    cl = sub.add_parser("clean", help="bersihkan entri launcher yang yatim")
-    cl.add_argument("filter", nargs="*", help="batasi ke nama tertentu, mis. traycer")
+    cl = sub.add_parser("clean", help="remove orphaned launcher entries")
+    cl.add_argument("filter", nargs="*", help="limit to a name, e.g. traycer")
     cl.add_argument("--stale", action="store_true",
-                    help="bersihkan versi lama: AppImage duplikat & folder runtime OpenBot")
-    cl.add_argument("--yes", "-y", action="store_true", help="tanpa konfirmasi")
-    cl.add_argument("--dry-run", action="store_true", help="tampilkan saja")
+                    help="remove old copies: duplicate AppImages and old OpenBot runtime folders")
+    cl.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    cl.add_argument("--dry-run", action="store_true", help="print only")
     cl.set_defaults(func=cmd_clean)
 
-    mn = sub.add_parser("manual", help="binary yang tidak dikelola dpkg")
-    mn.add_argument("--json", action="store_true", help="keluaran JSON")
+    mn = sub.add_parser("manual", help="binaries that dpkg does not own")
+    mn.add_argument("--json", action="store_true", help="JSON output")
     mn.set_defaults(func=cmd_manual)
 
-    sr = sub.add_parser("sources", help="status tiap sumber")
+    sr = sub.add_parser("sources", help="status of each source")
     sr.set_defaults(func=cmd_sources)
 
     args = ap.parse_args(argv)

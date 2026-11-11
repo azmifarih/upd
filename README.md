@@ -1,100 +1,118 @@
 # upd
 
-Update aplikasi yang **tidak** dikelola apt/snap: paket global npm/bun, tool
-Python (pipx, uv), binary cargo, flatpak, dan AppImage.
+Update apps that **apt and snap do not manage**: global npm and bun packages,
+Python tools (pipx, uv), cargo binaries, flatpak, AppImage, and a few installers.
+
+`scan` only checks. `update` is what changes the machine.
 
 ## GUI (GTK4 / libadwaita)
 
 ```bash
-upd-gui        # dari terminal
+upd-gui
 ```
 
-Atau cari **upd** di daftar aplikasi. Saat dibuka, app langsung berada di tab
-**Update** dan memeriksa versi terbaru sendiri.
+Or open **upd** from the app list. It starts on the **Update** tab and checks
+the latest versions itself.
 
-Isinya: dua tab (Update / Terpasang), pencarian, tombol ⟳ untuk memeriksa
-ulang, dan tombol Update per baris. Tiap baris yang punya jalur update punya
-**kotak centang**; centang beberapa lalu tekan **Update N terpilih** di header
-(atau menu **Pilih semua yang tampil** / **Batal pilih**). Centang juga berlaku
-di tab Terpasang, jadi kamu bisa memilih sambil melihat daftar lengkap.
+Two tabs: **Update** and **Installed**. Search, a refresh button, and an
+**Update** button on each row that has an automatic path. Those rows also have
+a checkbox. Tick a few, then press **Update N selected** in the header, or use
+**Select all shown** / **Clear selection**. The same checkboxes work on
+**Installed**.
 
-Klik satu baris untuk membuka halaman detail: sumber, versi, lokasi file,
-catatan, **Cara update**, plus tombol **Hapus…** yang terpisah dari Update dan
-selalu minta konfirmasi (AppImage dan binary manual dipindah ke Trash, paket
-manager memakai perintah resminya).
+Click a row for the detail page: source, version, file location, note, and
+**How to update**. **Delete…** sits apart from Update and always asks first.
+AppImage files and manual binaries go to Trash. Package managers use their own
+uninstall command.
 
-Menu: Update semua, Bersihkan launcher yatim, Bersihkan sisa versi lama, Tentang.
+The menu also has **Update all**, **Clean orphaned launchers**, **Clean old
+versions**, and **About**.
 
-Di baris yang punya tombol **Update**, tidak ada lagi chip "update" — tombolnya
-sudah menyatakan hal yang sama. Chip `manual` hanya muncul kalau ada versi baru
-tetapi tidak ada jalur otomatisnya. Halaman detail menampilkan **Cara update**
-(perintah/aksi yang akan dijalankan) sebelum kamu menekan tombolnya.
+A row with an **Update** button does not also show an "update" chip. The
+**Manual** chip appears only when a newer version exists and there is no
+automatic path.
 
-GUI memakai `/usr/bin/python3` karena PyGObject + GTK4 datang dari distro.
-Kalau `python3` di shell adalah venv (tanpa GTK), jalankan lewat desktop entry
-atau `upd-gui`.
+The window needs `/usr/bin/python3`, because PyGObject and GTK4 come from the
+distro. If `python3` in the shell is a virtualenv without GTK, use the desktop
+entry or `upd-gui`.
 
-## Pasang
+Source icons live in `icons/hicolor/` and are loaded from that folder.
+
+## Install
 
 ```bash
 ln -sf "$PWD/upd.py" ~/.local/bin/upd
-chmod +x upd.py
+ln -sf "$PWD/upd_gui.py" ~/.local/bin/upd-gui
+chmod +x upd.py upd_gui.py
 ```
 
-Butuh `python3` saja — tanpa dependensi.
+The CLI needs only `python3`. The GUI also needs PyGObject, GTK4, and libadwaita.
 
-## Pakai
+## Use
 
 ```bash
-upd scan                  # tabel semua aplikasi + versi terbaru
-upd scan --outdated       # hanya yang ada update
-upd scan --json           # untuk rutinitas / cron
-upd scan --only npm,pipx  # sumber tertentu
+upd scan                  # every app, plus the latest version
+upd scan --outdated       # only apps with an update
+upd scan --json           # machine-readable
+upd scan --only npm,pipx  # one or more sources
 
-upd update --dry-run      # lihat perintah yang akan dijalankan
-upd update                # minta konfirmasi, lalu jalankan
-upd update --only npm -y  # satu sumber, tanpa konfirmasi
-upd update --pick script:pi -y   # satu aplikasi saja
+upd update --dry-run      # print the commands
+upd update                # ask, then run
+upd update --only npm -y  # one source, no prompt
+upd update --pick script:pi -y   # one app
 
-upd sources               # status tiap sumber
+upd sources               # which sources are present
 ```
 
-`upd update` menjalankan semua sumber sekaligus: paket manager, asdf,
-self-update tool, AppImage (unduh lalu timpa), dan ollama. AppImage dan ollama
-mengunduh file besar (ratusan MB sampai ~1,5 GB), jadi `--dry-run` dulu kalau
-koneksi terbatas.
+`upd update` can cover package managers, asdf, self-update tools, AppImage
+downloads, and ollama. AppImage and ollama downloads are large (hundreds of MB,
+ollama about 1.5 GB), so run `--dry-run` first on a slow connection.
 
-`scan` selalu baca-saja. Hanya `update` yang mengubah sistem.
+A daily check is the same read-only scan, once:
 
-## Sumber
+```bash
+upd scan --outdated
+```
 
-| sumber | deteksi | cek versi | perintah update |
+That command does not install anything.
+
+## Sources
+
+| source | how it is found | latest version | update command |
 |---|---|---|---|
-| npm | `npm ls -g --json` + `lib/node_modules` di `/usr/local` | registry.npmjs.org | `npm install -g <pkg>@latest` (otomatis `sudo -n` kalau prefix root) |
+| npm | `npm ls -g --json`, plus `lib/node_modules` under `/usr/local` | registry.npmjs.org | `npm install -g <pkg>@latest` (`sudo -n` when the prefix is root) |
 | bun | `bun pm ls -g` | registry.npmjs.org | `bun add -g <pkg>` |
 | pipx | `pipx list --json` | pypi.org | `pipx upgrade <pkg>` |
 | uv | `uv tool list` | pypi.org | `uv tool upgrade <pkg>` |
 | cargo | `cargo install --list` | crates.io | `cargo install --force <pkg>` |
-| flatpak | `flatpak list` + `remote-ls --updates` | remote flatpak | `flatpak update -y <app>` |
-| appimage | glob `*.AppImage` | metadata updater di dalam file | unduh + timpa (nama file tetap) |
-| script | daftar tool installer curl | GitHub releases / commit | self-update / arsip rilis |
-| asdf | `asdf plugin-list` + `asdf current` | `asdf list-all` (stabil) | `asdf install` + `asdf global` |
-| manual | binary tanpa pemilik dpkg | GitHub releases bila dikenal | manual |
+| flatpak | `flatpak list` and `remote-ls --updates` | the flatpak remote | `flatpak update -y <app>` |
+| appimage | `*.AppImage` | updater metadata inside the file | download and replace (filename stays) |
+| script | known curl installers | GitHub releases or commit | self-update or the release archive |
+| asdf | `asdf plugin-list` and `asdf current` | `asdf list-all` (stable only) | `asdf install` then `asdf global` |
+| openbot | `~/.config/OpenBot/provider-runtimes` | npm, for display only | not updated by upd |
+| manual | binaries dpkg does not own | GitHub releases when known | manual |
 
-## Folder di luar PATH
+A pipx venv with no `pip` cannot `pipx upgrade`. upd then runs `pipx reinstall`
+for that package name.
 
-`~/.local/opt`, `~/opt`, `~/tools`, dan `/opt` ikut dipindai sampai 3 tingkat,
-jadi binary yang tidak pernah di-export ke PATH tetap ketemu. Yang dilewati:
-folder `lib`, `share`, `node_modules`, `.git`, file `.so`, `.pak`, `.desktop`,
-serta file AppImage (sudah ditangani sumber `appimage`).
+A git pull (`oh-my-zsh` and similar) is `git pull --ff-only`. Files marked
+skip-worktree are copied aside, the pull runs, then those files and the
+skip-worktree bit are put back.
 
-Kalau ada folder lain, tambahkan ke `OFFPATH_ROOTS` di skrip.
+Scans collect sources in parallel.
 
-## Versi yang tidak standar
+## Folders outside PATH
 
-Tidak semua tool menjawab `--version`. Yang punya perintah khusus:
+`~/.local/opt`, `~/opt`, `~/tools`, and `/opt` are scanned three levels deep,
+so a binary that was never added to `PATH` still shows up. Skipped: `lib`,
+`share`, `node_modules`, `.git`, `.so`, `.pak`, `.desktop`, and AppImage files
+(those belong to the `appimage` source).
 
-| tool | perintah |
+Add another root in `OFFPATH_ROOTS` in the script.
+
+## Versions that are not `--version`
+
+| tool | command |
 |---|---|
 | helm | `helm version --short` |
 | kubectl | `kubectl version --client` |
@@ -103,216 +121,201 @@ Tidak semua tool menjawab `--version`. Yang punya perintah khusus:
 | docker-compose | `docker-compose version` |
 | flux | `flux --version` |
 
-Build dari source tanpa versi (`dev build`, `vdev`) ditandai `dev`, bukan `?`.
+A source build with no version (`dev build`, `vdev`) is marked `dev`, not `?`.
 
-## Cek asal-usul binary
+## Where a binary came from
 
-`/usr/bin` tidak otomatis berarti apt. `upd` membaca daftar file milik semua
-paket dari `/var/lib/dpkg/info/*.list`, jadi kepemilikan bisa dipastikan tanpa
-menebak dari lokasi.
+A file in `/usr/bin` is not assumed to be apt. upd reads
+`/var/lib/dpkg/info/*.list`.
 
 ```bash
-upd manual          # semua binary yang tidak dimiliki paket dpkg
+upd manual          # binaries no dpkg package owns
 upd manual --json
 ```
 
-Symlink dilewati karena biasanya milik manajer lain (asdf shim, npm, pipx).
-File yang diawali `#!` juga dilewati karena itu script pembungkus, bukan binary.
+Symlinks are skipped (asdf shims, npm, pipx). A file that starts with `#!` is
+a wrapper, not a raw binary, and is skipped unless it has install metadata
+(see launchers below).
 
-## Folder PATH dari shell rc
+## PATH folders from shell rc
 
-Folder yang ditambahkan `~/.zshrc`, `~/.zshenv`, `~/.bashrc`, `~/.profile`, dan
-`/etc/profile.d/*.sh` ikut dipindai, jadi binary di lokasi tak lazim
-(`~/go/bin`, `~/.pulumi/bin`, `~/opt/bin`, `/opt/*/bin`) tetap ketemu.
+Directories added by `~/.zshrc`, `~/.zshenv`, `~/.bashrc`, `~/.profile`, and
+`/etc/profile.d/*.sh` are scanned. That covers `~/go/bin`, `~/.pulumi/bin`,
+`~/opt/bin`, and `/opt/*/bin`.
 
-## Token GitHub
+## GitHub token
 
-Cek versi terbaru memakai API GitHub: 60 permintaan/jam tanpa token, 5.000/jam
-dengan token. `upd` memakai `GITHUB_TOKEN`/`GH_TOKEN` bila ada, kalau tidak
-mengambil dari `gh auth token`. Token tidak pernah ditampilkan atau ditulis ke
-cache. Kalau kena batas, kolom versi terbaru berisi `?` dengan catatan
-`rate limit`.
+Latest-version checks use the GitHub API: 60 requests per hour without a
+token, 5,000 with one. upd uses `GITHUB_TOKEN` or `GH_TOKEN` when set, and
+otherwise `gh auth token`. The token is never printed or written to the cache.
+On a rate limit the latest column is `?` and the note says to set
+`GITHUB_TOKEN`.
 
-## Installer `curl | sh`
+## `curl | sh` installers
 
-Tool yang dipasang lewat script installer dideteksi dari lokasinya
-(`~/.bun`, `~/.local/bin`, `~/.cargo/bin`, `~/.deno`, `/usr/local/bin`,
-`~/.oh-my-zsh`). `/usr/bin` sengaja dilewati karena itu wilayah apt.
+These are detected from where they live (`~/.bun`, `~/.local/bin`,
+`~/.cargo/bin`, `~/.deno`, `/usr/local/bin`, `~/.oh-my-zsh`). `/usr/bin` is
+left to apt.
 
-Bawaan yang dikenali: bun, uv, rustup, deno, ollama, starship, zoxide,
-oh-my-zsh. Yang punya self-update dijalankan otomatis (`bun upgrade`,
-`uv self update`, `rustup self update`). Yang tidak punya hanya dilaporkan
-beserta perintah manualnya.
+Built-in names: bun, uv, rustup, deno, ollama, starship, zoxide, oh-my-zsh.
+Tools with a self-update run it (`bun upgrade`, `uv self update`,
+`rustup self update`). The others are reported with a manual command.
 
-**ollama** dikecualikan dari aturan itu: update-nya mengunduh
-`ollama-linux-amd64.tar.zst` resmi (~1,5 GB), memasang `bin/ollama` dan
-`lib/ollama/` (folder CUDA yang sudah ada tidak disentuh), lalu me-restart
-service hanya kalau service-nya memang sedang aktif. Tidak ada skrip installer
-yang dijalankan.
+**ollama** is different. The update downloads the official
+`ollama-linux-amd64.tar.zst` (about 1.5 GB), installs `bin/ollama` and
+`lib/ollama/` (an existing CUDA folder is left in place), and restarts the
+service only when it is already active. No installer script is run.
 
-Tool lain bisa didaftarkan sekali:
+Register another tool once:
 
 ```bash
 upd script add fzf ~/.local/bin/fzf junegunn/fzf --cmd "fzf --version"
 upd script list
 ```
 
-Versi terbaru diambil dari release GitHub terakhir; kalau repo tidak punya
-release, dipakai tag teratas. Untuk repo yang hanya punya commit (mis.
-oh-my-zsh), yang dibandingkan adalah hash commit.
+The latest version is the newest GitHub release. With no release, the top tag
+is used. A commit-only repo (oh-my-zsh) is compared by commit hash.
 
 ## AppImage
 
-Versi dibaca dari metadata di dalam AppImage itu sendiri: `X-AppImage-Version`
-di file `.desktop`, lalu `resources/app-update.yml` (electron-updater) yang
-menyebut `provider: github` + `owner/repo`, atau `provider: generic` + URL feed.
-Semua hasil extract di-cache per mtime+size, jadi `scan` berikutnya instan.
+The version comes from inside the AppImage: `X-AppImage-Version` in the
+`.desktop` file, then `resources/app-update.yml` (electron-updater) with
+`provider: github` plus `owner/repo`, or `provider: generic` plus a feed URL.
+Extracted metadata is cached by mtime and size.
 
-Kalau aplikasinya memakai feed `generic` (bukan GitHub), versi terbaru diambil
-dari `latest-linux.yml` di feed itu, termasuk `sha512` untuk verifikasi unduhan.
-
-Update berjalan otomatis:
+A `generic` feed is read from `latest-linux.yml`, including `sha512` when the
+feed publishes one.
 
 ```bash
 upd update --pick appimage:Cloudroom.AppImage -y
 ```
 
-Alurnya: unduh asset `.AppImage` terbaru → cek sha512 (kalau feed menyediakannya)
-→ cek magic ELF + ukuran → backup ke `~/.cache/upd/backup/` → timpa file lama
-(**nama file tidak diubah**, jadi entri menu tetap menunjuk ke tempat yang sama)
-→ baca ulang versi di dalam file baru; kalau isinya bukan versi yang diminta,
-versi lama dikembalikan.
+The steps: download the newest `.AppImage` asset, check sha512 when the feed
+has one, check the ELF magic and the size, back up under `~/.cache/upd/backup/`,
+replace the old file (**the filename stays**, so the menu entry still points at
+it), then read the version inside the new file. If that version is not the one
+requested, the old file is restored.
 
-Yang tidak punya metadata updater sama sekali tetap bisa dipetakan manual:
+Map an AppImage that has no updater metadata:
 
 ```bash
 upd appimage map ~/Applications/traycer-desktop.AppImage owner/repo
 upd appimage list
 ```
 
-Versi lama dari aplikasi yang sama (dua file AppImage dengan `Name` yang sama)
-ditandai sisa, bukan update; bersihkan dengan `upd clean --stale`.
+An older copy of the same app (two AppImage files with the same `Name`) is
+marked as leftover, not as an update. Remove it with `upd clean --stale`.
 
 ```bash
-upd list                  # semua yang terpasang, offline (~3 detik)
-upd list --only npm       # satu sumber
-upd list --json           # untuk diolah
+upd list                  # installed apps, offline
+upd list --only npm
+upd list --json
 
-upd scan                  # bandingkan dengan versi terbaru (butuh jaringan)
+upd scan                  # compare with the latest version (needs the network)
 ```
 
-`list` menjawab "apa saja yang ada di mesin ini"; `scan` menjawab "mana yang
-ketinggalan". `list` juga memuat binary manual yang tidak dikelola paket apa
-pun — versinya `-` kalau tidak ada cara membacanya.
+`list` answers what is on this machine. `scan` answers what is behind. `list`
+also includes manual binaries. Their version is `-` when there is no way to
+read it.
 
-## Launcher script (deteksi otomatis)
+## Script launchers
 
-Banyak tool dipasang sebagai **shell launcher**, bukan binary — contohnya
-`~/.local/bin/pi` yang `exec` ke `~/.pi/agent/install/releases/<versi>/...`.
-Dulu semuanya dilewati karena ber-shebang. Sekarang dibedakan:
+Some tools are shell launchers, not binaries. `~/.local/bin/pi` can `exec`
+into `~/.pi/agent/install/releases/<version>/...`. A shebang alone used to hide
+them. The check is now:
 
-1. **Shebang** — `#!/usr/bin/python*`, `pipx`, atau `node`/`bun` dilewati
-   karena sudah diurus sumbernya (pipx, uv, npm). Shell launcher lanjut.
-2. **Metadata** — dicari `install/current-version` + `node_modules/.bin/<nama>`
-   (managed install), atau `package.json` terdekat (npm-style).
-3. **Probe** — versi dibaca dari `<launcher> --version`.
-4. **Perintah update** — kalau managed install dan `<nama> update --help`
-   berhasil, dipakai `<nama> update`.
+1. **Shebang** — `#!/usr/bin/python*`, pipx, or `node`/`bun` is left to pipx,
+   uv, or npm. Other shell launchers continue.
+2. **Metadata** — `install/current-version` plus `node_modules/.bin/<name>`,
+   or the nearest `package.json`.
+3. **Probe** — `<launcher> --version`.
+4. **Update command** — for a managed install, `<name> update` when
+   `<name> update --help` succeeds.
 
-Yang tidak punya metadata sama sekali tetap perlu didaftarkan manual:
-`upd script add NAMA PATH OWNER/REPO`.
+Anything with no metadata still needs `upd script add NAME PATH OWNER/REPO`.
 
-## Runtime OpenBot
+## OpenBot runtimes
 
-OpenBot membundel runtime sendiri di `~/.config/OpenBot/provider-runtimes/<app>/<target>/<versi>`.
-Runtime itu muncul sebagai sumber `openbot`, dibandingkan dengan rilis npm, dan
-**tidak** diupdate oleh `upd` — OpenBot yang mengurusnya. Contoh: `pi`.
+OpenBot keeps its own runtimes in
+`~/.config/OpenBot/provider-runtimes/<app>/<target>/<version>`. They show up
+as the `openbot` source. The note can mention a newer npm release. **upd does
+not install that update.** OpenBot does. Example: `pi`, `codex`.
 
-Install Pi milik user (`~/.pi/agent`) terdeteksi terpisah sebagai `script:pi`
-dan diupdate dengan `pi update`.
+A user install of Pi (`~/.pi/agent`) is a separate `script:pi` row and updates
+with `pi update`.
 
-## Update binary dari GitHub
+## GitHub binaries
 
 ```bash
-upd update --binaries --dry-run     # lihat asset yang akan diunduh
-upd update --binaries --only script # jalankan
+upd update --binaries --dry-run
+upd update --binaries --only script
 ```
 
-Alurnya: pilih asset `linux/amd64` → unduh → ekstrak (tar.gz/zip) → cek magic
-ELF dan ukuran minimal → backup ke `~/.cache/upd/backup/` → timpa → jalankan
-`--version`/`version`/`--help`. Kalau binary baru gagal jalan, versi lama
-dipulihkan otomatis.
+Pick a `linux/amd64` asset, download it, extract tar.gz or zip, check the ELF
+magic and a minimum size, back up under `~/.cache/upd/backup/`, replace the
+file, then run `--version`, `version`, or `--help`. If the new binary does not
+run, the old one is restored.
 
-Target di `/usr/local/bin` ditangani otomatis: `upd` mencoba menulis langsung,
-dan kalau lokasinya milik root ia memakai `sudo -n` untuk file itu saja.
+A target in `/usr/local/bin` is written directly when possible. If the
+directory is root-owned, that one file uses `sudo -n`.
 
-Kalau sudo di mesinmu minta password, jalankan dengan path penuh:
+If sudo asks for a password, call upd by its full path:
 
 ```bash
 sudo ~/.local/bin/upd update --binaries --only-binaries -y
 ```
 
-`sudo upd` tidak jalan karena sudo membuang PATH user; `upd` ada di
-`~/.local/bin` yang bukan bagian `secure_path` root.
+`sudo upd` fails because sudo drops the user `PATH`, and `upd` lives in
+`~/.local/bin`, which is not in root's `secure_path`.
 
-Repo yang tidak menyediakan binary di GitHub memakai URL resmi
-(`helm` → get.helm.sh, `terraform` → releases.hashicorp.com).
+Repos with no GitHub binary use their official URL (`helm` from get.helm.sh,
+`terraform` from releases.hashicorp.com).
 
 ## asdf
 
-`asdf current` dipakai untuk tahu versi yang **aktif**; plugin yang tidak punya
-versi aktif dilewati (bukan ditampilkan sebagai `?`). Versi terbaru diambil dari
-`asdf list-all <plugin>` milik plugin itu sendiri — bukan dari daftar repo yang
-dihardcode — dan versi pra-rilis (`alpha`, `beta`, `rc`, `dev`) dibuang.
+`asdf current` is the **active** version. A plugin with no active version is
+skipped, not shown as `?`. The latest version comes from `asdf list-all` for
+that plugin. Pre-releases (`alpha`, `beta`, `rc`, `dev`) are dropped.
 
 ```bash
 upd update --pick asdf:kubectl -y
 # asdf install kubectl 1.37.2 && asdf global kubectl 1.37.2
 ```
 
-Setelah memasang, `upd` memeriksa `asdf current <plugin>` benar-benar menunjuk
-versi baru; kalau tidak, update dilaporkan gagal.
+After install, upd checks `asdf current <plugin>`. If it does not point at the
+new version, the update is reported as failed.
 
-## npm global di prefix lain
+## npm globals in another prefix
 
-`npm ls -g` hanya melihat prefix npm milik user (nvm dsb.). Paket yang dipasang
-dengan `npm -g --prefix /usr/local` (mis. `elasticdump`) dibaca langsung dari
-`/usr/local/lib/node_modules/*/package.json`, lalu diupdate dengan perintah yang
-sama + `sudo -n` bila foldernya milik root.
+`npm ls -g` only sees the user prefix (nvm and similar). Packages installed
+with `npm -g --prefix /usr/local` (for example `elasticdump`) are read from
+`/usr/local/lib/node_modules/*/package.json` and updated with the same command
+plus `sudo -n` when that folder is root-owned.
 
-## Bersihkan sisa versi lama
+## Old versions
 
 ```bash
 upd clean --stale --dry-run
 upd clean --stale -y
 ```
 
-Yang dibersihkan: AppImage lama dari aplikasi yang sama (dua file dengan `Name`
-identik) dan folder versi lama runtime OpenBot
-(`~/.config/OpenBot/provider-runtimes/<app>/<target>/<versi-lama>`). Semua
-dipindah ke Trash, bukan dihapus.
+This moves leftover AppImage copies (two files with the same `Name`) and old
+OpenBot runtime folders
+(`~/.config/OpenBot/provider-runtimes/<app>/<target>/<old-version>`) to Trash.
+It does not delete them.
 
-## Hapus aplikasi
+## Remove an app
 
 ```bash
-upd uninstall <nama>               # tampilkan rencana, lalu tanya y/N
-upd uninstall npm:cline --dry-run  # lihat perintahnya saja
-upd uninstall npm:cline -y         # tanpa konfirmasi
-upd remove Cloudroom.AppImage      # AppImage -> Trash, bukan hapus permanen
+upd uninstall <name>               # show the plan, then ask y/N
+upd uninstall npm:cline --dry-run
+upd uninstall npm:cline -y
+upd remove Cloudroom.AppImage      # AppImage goes to Trash
 ```
 
-- Nama harus unik. Kalau ada di beberapa sumber, pakai `sumber:nama`.
-- Tool inti (`npm`, `pnpm`, `bun`, `uv`, `cargo`, `rustup`, `pipx`, `asdf`,
-  `git`, `docker`, `python3`) ditolak kecuali memakai `--force`.
-- AppImage dipindah ke `~/.local/share/Trash` (ada `.trashinfo`), jadi masih
-  bisa dikembalikan.
-- Binary manual dan plugin asdf tidak dihapus otomatis; hanya ditunjukkan
-  lokasi file dan perintah manualnya.
-
-## Rutin
-
-Cek harian tanpa menyentuh apa pun:
-
-```
-0 8 * * *  ~/.local/bin/upd scan --outdated --json > ~/.cache/upd/harian.json
-```
+- The name must match one app. If it exists in several sources, use `source:name`.
+- Core tools (`npm`, `pnpm`, `bun`, `uv`, `cargo`, `rustup`, `pipx`, `asdf`,
+  `git`, `docker`, `python3`) are refused unless you pass `--force`.
+- AppImage files move to `~/.local/share/Trash` with a `.trashinfo` file.
+- Manual binaries and asdf plugins are not deleted for you. The command shows
+  the file and the manual step.

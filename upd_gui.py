@@ -1,13 +1,13 @@
 #!/usr/bin/python3
-"""upd — GUI GTK4/libadwaita untuk mengelola aplikasi di luar apt/snap.
+"""upd — GTK4/libadwaita window for apps outside apt and snap.
 
-Jalankan: upd-gui
-Butuh /usr/bin/python3 (PyGObject + GTK4 + libadwaita dari distro).
+Run: upd-gui
+Needs /usr/bin/python3 (distro PyGObject, GTK4, and libadwaita).
 """
 
-import os
 import sys
 import threading
+from html import escape
 from pathlib import Path
 
 import gi
@@ -21,27 +21,40 @@ sys.path.insert(0, str(HERE))
 import upd  # noqa: E402
 
 APP_ID = "dev.azmi.upd"
+ICON_ROOT = HERE / "icons"
+
+# Ikon simbolis di icons/hicolor. Warnanya di CSS supaya ikut tema terang/gelap.
+SOURCE_ICON = {
+    "npm": "upd-npm-symbolic",
+    "bun": "upd-bun-symbolic",
+    "pipx": "upd-pipx-symbolic",
+    "uv": "upd-uv-symbolic",
+    "cargo": "upd-cargo-symbolic",
+    "flatpak": "upd-flatpak-symbolic",
+    "asdf": "upd-asdf-symbolic",
+    "script": "upd-script-symbolic",
+    "appimage": "upd-appimage-symbolic",
+    "manual": "upd-manual-symbolic",
+    "openbot": "upd-openbot-symbolic",
+    "binary": "upd-binary-symbolic",
+}
 
 CSS = b"""
-.chip {
-  font-size: 10px; font-weight: 700; letter-spacing: .04em;
-  padding: 3px 8px; border-radius: 999px;
-  background: alpha(currentColor, .10);
-  color: alpha(currentColor, .75);
-}
-.chip-npm      { background: alpha(#e01b24, .16); color: #e01b24; }
-.chip-bun      { background: alpha(#f6d32d, .22); color: #b58900; }
-.chip-pipx     { background: alpha(#1c71d8, .16); color: #1c71d8; }
-.chip-uv       { background: alpha(#813d9c, .16); color: #813d9c; }
-.chip-cargo    { background: alpha(#c64600, .16); color: #c64600; }
-.chip-flatpak  { background: alpha(#26a269, .16); color: #26a269; }
-.chip-asdf     { background: alpha(#613583, .16); color: #613583; }
-.chip-script   { background: alpha(#3584e4, .16); color: #3584e4; }
-.chip-appimage { background: alpha(#e66100, .16); color: #e66100; }
-.chip-manual   { background: alpha(currentColor, .10); color: alpha(currentColor, .70); }
-.chip-update   { background: alpha(#e5a50a, .20); color: #b07500; }
-.statusbar { padding: 6px 14px; }
-.hero { font-size: 13px; }
+.src-npm      { color: #ff6d6d; }
+.src-bun      { color: #f6d32d; }
+.src-pipx     { color: #7db8ff; }
+.src-uv       { color: #d9a0ea; }
+.src-cargo    { color: #ffa573; }
+.src-flatpak  { color: #57e389; }
+.src-asdf     { color: #c8b0e8; }
+.src-script   { color: #8cc8ff; }
+.src-appimage { color: #ffb066; }
+.src-openbot  { color: #ff8a4c; }
+.src-manual, .src-binary { color: alpha(currentColor, .82); }
+.ok-mark { color: #57e389; }
+.warn-mark { color: #f6d32d; }
+.statusbar { padding: 8px 16px; }
+.menu-item { padding: 0; border-radius: 8px; }
 """
 
 
@@ -53,110 +66,179 @@ def label(text, *classes):
     return w
 
 
+def source_image(src, size=16):
+    icon = SOURCE_ICON.get(src, "package-x-generic-symbolic")
+    img = Gtk.Image.new_from_icon_name(icon)
+    img.set_pixel_size(size)
+    img.set_valign(Gtk.Align.CENTER)
+    img.add_css_class(f"src-{src}" if src in SOURCE_ICON else "src-manual")
+    img.set_tooltip_text(src)
+    return img
+
+
+def icon_button(icon, text, *classes):
+    btn = Gtk.Button()
+    box = Gtk.Box(spacing=6)
+    img = Gtk.Image.new_from_icon_name(icon)
+    img.set_pixel_size(16)
+    lab = Gtk.Label(label=text)
+    box.append(img)
+    box.append(lab)
+    btn.set_child(box)
+    btn._upd_label = lab
+    for c in classes:
+        btn.add_css_class(c)
+    return btn
+
+
+def install_icon_theme(display):
+    theme = Gtk.IconTheme.get_for_display(display)
+    path = str(ICON_ROOT)
+    if path not in list(theme.get_search_path()):
+        theme.add_search_path(path)
+
+
 class Row(Adw.ActionRow):
-    def __init__(self, data, on_toggle=None, selected=False):
-        name = data["name"]
-        if len(name) > 46:
-            name = name[:43] + "…"
-        super().__init__(title=name)
-
+    def __init__(self, data, on_toggle=None, selected=False, gutter=False):
+        super().__init__(title=escape(data["name"]))
         src = data["source"]
-        chips = Gtk.Box(spacing=6)
-        chips.set_valign(Gtk.Align.CENTER)
+        cur, latest = str(data["current"]), str(data["latest"])
+        if data["has_update"] and latest not in ("?", cur):
+            subtitle = f"{cur}  →  {latest}    ·    {src}"
+        else:
+            subtitle = f"{cur}    ·    {src}"
+        self.set_subtitle(escape(subtitle))
 
+        prefix = Gtk.Box(spacing=10)
+        prefix.set_valign(Gtk.Align.CENTER)
         self.check = None
         if on_toggle is not None and data["has_update"] and data["upgrade"]:
             self.check = Gtk.CheckButton()
             self.check.set_valign(Gtk.Align.CENTER)
-            self.check.set_tooltip_text("Pilih untuk update")
+            self.check.set_tooltip_text("Select for update")
             self.check.set_active(bool(selected))
             self.check.connect("toggled", lambda cb: on_toggle(data, cb.get_active()))
-            chips.append(self.check)
+            prefix.append(self.check)
+        elif gutter:
+            gap = Gtk.CheckButton()
+            gap.set_opacity(0)
+            gap.set_sensitive(False)
+            gap.set_can_target(False)
+            prefix.append(gap)
+        prefix.append(source_image(src, 20))
+        self.add_prefix(prefix)
 
-        chips.append(label(src, "chip", f"chip-{src}"))
-        self.add_prefix(chips)
-
-        cur, latest = str(data["current"]), str(data["latest"])
-        if data["has_update"] and latest not in ("?", cur):
-            self.set_subtitle(f"{cur}  →  {latest}")
-            if hasattr(self, "add_suffix") and not data["upgrade"]:
-                # tanpa tombol Update, chip ini yang menjelaskan kenapa tidak ada aksi
-                self.add_suffix(label("manual", "chip"))
-        else:
-            self.set_subtitle(cur)
-
+        self.update_button = None
         if data["has_update"] and data["upgrade"]:
-            btn = Gtk.Button(label="Update")
-            btn.add_css_class("pill")
-            btn.add_css_class("suggested-action")
+            btn = icon_button("software-update-available-symbolic", "Update",
+                              "pill", "suggested-action")
             btn.set_valign(Gtk.Align.CENTER)
-            if hasattr(self, "add_suffix"):
-                self.add_suffix(btn)
+            self.add_suffix(btn)
             self.update_button = btn
+        elif data["has_update"]:
+            hint = Gtk.Box(spacing=6)
+            hint.set_valign(Gtk.Align.CENTER)
+            mark = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+            mark.set_pixel_size(16)
+            mark.add_css_class("warn-mark")
+            hint.append(mark)
+            hint.append(label("Manual", "dim-label"))
+            hint.set_tooltip_text("A newer version exists, but there is no automatic update")
+            self.add_suffix(hint)
 
 
 REMOVABLE = {"npm", "bun", "pipx", "uv", "cargo", "flatpak", "appimage", "manual"}
 
 
 class DetailDialog(Adw.Dialog):
-    """Halaman detail: update sebagai aksi utama, hapus dijauhkan dari situ."""
+    """Detail page: update is the main action, delete sits on the other side."""
 
     def __init__(self, data, win):
-        super().__init__(title=data["name"])
-        self.set_content_width(560)
+        super().__init__(title="")
+        self.set_content_width(640)
         self.data = data
         self.win = win
 
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{m}")(18)
 
-        info = Adw.PreferencesGroup()
-        info.add(Adw.ActionRow(title="Sumber", subtitle=data["source"]))
-        info.add(Adw.ActionRow(title="Terpasang", subtitle=str(data["current"])))
-        info.add(Adw.ActionRow(title="Terbaru", subtitle=str(data["latest"])))
+        hero = Gtk.Box(spacing=14)
+        hero.append(source_image(data["source"], 40))
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        titles.set_valign(Gtk.Align.CENTER)
+        name = Gtk.Label(label=data["name"], xalign=0)
+        name.add_css_class("title-2")
+        name.set_wrap(True)
+        name.set_selectable(True)
+        cur, latest = str(data["current"]), str(data["latest"])
+        if data["has_update"] and latest not in ("?", cur):
+            version = f"{cur}  →  {latest}"
+        else:
+            version = cur
+        sub = Gtk.Label(label=f"{data['source']}   ·   {version}", xalign=0)
+        sub.add_css_class("dim-label")
+        sub.set_selectable(True)
+        titles.append(name)
+        titles.append(sub)
+        hero.append(titles)
+        box.append(hero)
+
+        facts = []
         if data.get("target"):
-            info.add(Adw.ActionRow(title="Lokasi", subtitle=str(data["target"])))
+            facts.append(self._fact("Location", str(data["target"]), "folder-symbolic"))
         if data.get("note"):
-            info.add(Adw.ActionRow(title="Catatan", subtitle=str(data["note"])))
+            facts.append(self._fact("Note", str(data["note"]), "dialog-information-symbolic"))
         if data.get("upgrade"):
-            info.add(Adw.ActionRow(title="Cara update",
-                                   subtitle=upd.describe_upgrade(data["upgrade"])))
+            facts.append(self._fact("How to update", upd.describe_upgrade(data["upgrade"]),
+                                   "software-update-available-symbolic"))
+        elif data["has_update"]:
+            facts.append(self._fact("How to update", "No automatic path yet", "dialog-warning-symbolic"))
         if data.get("url"):
-            info.add(Adw.ActionRow(title="Halaman rilis", subtitle=str(data["url"])))
-        box.append(info)
+            link = self._fact("Release page", str(data["url"]), "web-browser-symbolic")
+            link.set_activatable(True)
+            link.add_suffix(Gtk.Image.new_from_icon_name("adw-external-link-symbolic"))
+            link.connect("activated", lambda *_: self._open_url(str(data["url"])))
+            facts.append(link)
+        if facts:
+            info = Adw.PreferencesGroup()
+            for fact in facts:
+                info.add(fact)
+            box.append(info)
 
         actions = Gtk.Box(spacing=8)
-        actions.set_halign(Gtk.Align.END)
-
+        if data["source"] in REMOVABLE:
+            rm = icon_button("user-trash-full-symbolic", "Delete…", "pill", "destructive-action")
+            rm.connect("clicked", self._confirm_remove)
+            actions.append(rm)
+        actions.append(Gtk.Box(hexpand=True))
         if data["has_update"] and data["upgrade"]:
-            btn = Gtk.Button(label="Update")
-            btn.add_css_class("pill")
-            btn.add_css_class("suggested-action")
+            btn = icon_button("software-update-available-symbolic", "Update",
+                              "pill", "suggested-action")
             btn.connect("clicked", self._on_update)
             actions.append(btn)
         elif data["has_update"]:
-            hint = label("Update perlu manual", "chip")
-            actions.append(hint)
-
-        if data["source"] in REMOVABLE:
-            rm = Gtk.Button(label="Hapus…")
-            rm.add_css_class("pill")
-            rm.add_css_class("destructive-action")
-            rm.connect("clicked", self._confirm_remove)
-            actions.append(rm)
-
-        close = Gtk.Button(label="Tutup")
-        close.add_css_class("pill")
-        close.connect("clicked", lambda *_: self.close())
-        actions.append(close)
-
+            actions.append(label("Update is manual", "dim-label"))
         box.append(actions)
+
         view.set_content(box)
         self.set_child(view)
+
+    @staticmethod
+    def _fact(title, subtitle, icon):
+        row = Adw.ActionRow(title=escape(title), subtitle=escape(subtitle or "—"))
+        row.set_subtitle_selectable(True)
+        row.set_subtitle_lines(3)
+        img = Gtk.Image.new_from_icon_name(icon)
+        img.set_pixel_size(16)
+        row.add_prefix(img)
+        return row
+
+    def _open_url(self, url):
+        Gtk.UriLauncher.new(url).launch(self.win, None, None)
 
     def _on_update(self, *_):
         self.win.start_update(self.data)
@@ -164,11 +246,11 @@ class DetailDialog(Adw.Dialog):
 
     def _confirm_remove(self, *_):
         src, name = self.data["source"], self.data["name"]
-        cara = "Dipindah ke Trash, masih bisa dikembalikan." if src in ("appimage", "manual") \
-            else "Dihapus lewat perintah resmi paketnya."
-        dlg = Adw.AlertDialog(heading=f"Hapus {name}?", body=cara)
-        dlg.add_response("cancel", "Batal")
-        dlg.add_response("ok", "Hapus")
+        cara = "Moved to Trash. You can restore it." if src in ("appimage", "manual") \
+            else "Removed with that package manager's own command."
+        dlg = Adw.AlertDialog(heading=f"Delete {name}?", body=cara)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Delete")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
         dlg.connect("response", lambda d, r: self._remove(r))
         dlg.present(self)
@@ -204,6 +286,8 @@ class Window(Adw.ApplicationWindow):
         self.view = "installed"
         self.busy = False
         self.selected = {}
+        install_icon_theme(self.get_display())
+        self.set_icon_name(APP_ID)
         self._load_css()
         self._build()
         self.viewstack.set_visible_child_name("updates")
@@ -218,10 +302,10 @@ class Window(Adw.ApplicationWindow):
             self.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-    def _make_page(self):
+    def _make_page(self, empty_icon, empty_title, empty_desc):
         lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         lb.add_css_class("boxed-list")
-        lb.set_margin_top(12)
+        lb.set_margin_top(6)
         lb.set_margin_bottom(18)
         lb.set_margin_start(18)
         lb.set_margin_end(18)
@@ -233,25 +317,47 @@ class Window(Adw.ApplicationWindow):
 
         st = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         st.add_named(scroll, "list")
-        empty = Adw.StatusPage(
-            icon_name="emblem-ok-symbolic",
-            title="Tidak ada update",
-            description="Semua aplikasi sudah versi terbaru.",
-        )
+        empty = Adw.StatusPage(icon_name=empty_icon, title=empty_title, description=empty_desc)
         st.add_named(empty, "empty")
         return lb, st, empty
+
+    def _menu_button_row(self, icon, text, action):
+        btn = Gtk.Button()
+        btn.add_css_class("flat")
+        btn.add_css_class("menu-item")
+        box = Gtk.Box(spacing=10)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(10)
+        box.set_margin_end(12)
+        img = Gtk.Image.new_from_icon_name(icon)
+        img.set_pixel_size(16)
+        lab = Gtk.Label(label=text, xalign=0, hexpand=True)
+        box.append(img)
+        box.append(lab)
+        btn.set_child(box)
+        btn.connect("clicked", lambda *_: self._fire_menu(action))
+        return btn
+
+    def _fire_menu(self, action):
+        pop = self.menu_btn.get_popover()
+        if pop is not None:
+            pop.popdown()
+        self.activate_action(action, None)
 
     def _build(self):
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
 
-        self.list_installed, self.stack_installed, self.empty_installed = self._make_page()
-        self.list_updates, self.stack_updates, self.empty_updates = self._make_page()
+        self.list_installed, self.stack_installed, self.empty_installed = self._make_page(
+            "system-search-symbolic", "No results", "Try another search.")
+        self.list_updates, self.stack_updates, self.empty_updates = self._make_page(
+            "emblem-ok-symbolic", "No updates", "Every app is already current.")
 
         self.viewstack = Adw.ViewStack()
         self.viewstack.add_titled_with_icon(
-            self.stack_installed, "installed", "Terpasang", "view-list-symbolic")
-        self.viewstack.add_titled_with_icon(
+            self.stack_installed, "installed", "Installed", "view-list-symbolic")
+        self.page_updates = self.viewstack.add_titled_with_icon(
             self.stack_updates, "updates", "Update", "software-update-available-symbolic")
         self.viewstack.connect("notify::visible-child-name", lambda *_: (self._rebuild(), self._sync_selection()))
 
@@ -260,36 +366,57 @@ class Window(Adw.ApplicationWindow):
         header.set_title_widget(self.switcher)
 
         scan_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        scan_btn.set_tooltip_text("Periksa update (butuh jaringan)")
+        scan_btn.set_tooltip_text("Check for updates (needs the network)")
         scan_btn.connect("clicked", lambda *_: self.reload(network=True))
         header.pack_start(scan_btn)
 
-        self.sel_btn = Gtk.Button(label="Update terpilih")
-        self.sel_btn.add_css_class("suggested-action")
+        self.sel_btn = icon_button("software-update-available-symbolic", "Update selected",
+                                   "suggested-action")
         self.sel_btn.set_valign(Gtk.Align.CENTER)
         self.sel_btn.set_visible(False)
         self.sel_btn.connect("clicked", self._confirm_update_selected)
         header.pack_end(self.sel_btn)
 
-        menu = Gio.Menu()
-        menu.append("Periksa update", "win.scan")
-        menu.append("Pilih semua yang tampil", "win.select-all")
-        menu.append("Batal pilih", "win.select-none")
-        menu.append("Update semua", "win.update-all")
-        menu.append("Bersihkan launcher yatim", "win.clean")
-        menu.append("Bersihkan sisa versi lama", "win.clean-stale")
-        menu.append("Tentang", "win.about")
-        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
-        header.pack_end(menu_btn)
+        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        menu_box.set_margin_top(4)
+        menu_box.set_margin_bottom(4)
+        menu_box.set_margin_start(4)
+        menu_box.set_margin_end(4)
+        entries = (
+            ("view-refresh-symbolic", "Check for updates", "win.scan"),
+            ("edit-select-all-symbolic", "Select all shown", "win.select-all"),
+            ("edit-clear-symbolic", "Clear selection", "win.select-none"),
+            ("software-update-available-symbolic", "Update all", "win.update-all"),
+        )
+        for icon, text, action in entries:
+            menu_box.append(self._menu_button_row(icon, text, action))
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(4)
+        sep.set_margin_bottom(4)
+        menu_box.append(sep)
+        for icon, text, action in (
+            ("edit-delete-symbolic", "Clean orphaned launchers", "win.clean"),
+            ("user-trash-full-symbolic", "Clean old versions", "win.clean-stale"),
+            ("help-about-symbolic", "About", "win.about"),
+        ):
+            menu_box.append(self._menu_button_row(icon, text, action))
+        pop = Gtk.Popover()
+        pop.set_child(menu_box)
+        self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", popover=pop)
+        self.menu_btn.set_tooltip_text("Menu")
+        header.pack_end(self.menu_btn)
 
-        self.search = Gtk.SearchEntry(placeholder_text="Cari aplikasi…")
-        self.search.set_margin_top(6)
-        self.search.set_margin_bottom(6)
-        self.search.set_margin_start(12)
-        self.search.set_margin_end(12)
+        self.search = Gtk.SearchEntry(placeholder_text="Search apps or sources…")
+        self.search.set_margin_top(10)
+        self.search.set_margin_bottom(4)
+        self.search.set_margin_start(18)
+        self.search.set_margin_end(18)
         self.search.connect("search-changed", lambda *_: self._rebuild())
+        search_clamp = Adw.Clamp(maximum_size=920, child=self.search)
 
         self.spinner = Gtk.Spinner()
+        self.status_icon = Gtk.Image.new_from_icon_name("emblem-synchronizing-symbolic")
+        self.status_icon.set_pixel_size(16)
         self.status = label("", "statusbar")
         self.status.set_xalign(0)
         self.status.set_hexpand(True)
@@ -297,10 +424,11 @@ class Window(Adw.ApplicationWindow):
         bar = Gtk.Box(spacing=8)
         bar.add_css_class("statusbar")
         bar.append(self.spinner)
+        bar.append(self.status_icon)
         bar.append(self.status)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        body.append(self.search)
+        body.append(search_clamp)
         body.append(self.viewstack)
         body.append(bar)
 
@@ -325,13 +453,29 @@ class Window(Adw.ApplicationWindow):
 
     # ---------------------------------------------------------------- data
 
+    def _set_status(self, text, kind):
+        self.status.set_text(text)
+        icons = {
+            "busy": "emblem-synchronizing-symbolic",
+            "ok": "emblem-ok-symbolic",
+            "warn": "software-update-available-symbolic",
+            "err": "dialog-warning-symbolic",
+        }
+        self.status_icon.set_from_icon_name(icons[kind])
+        for css in ("ok-mark", "warn-mark"):
+            self.status_icon.remove_css_class(css)
+        if kind == "ok":
+            self.status_icon.add_css_class("ok-mark")
+        elif kind in ("warn", "err"):
+            self.status_icon.add_css_class("warn-mark")
+
     def reload(self, network=False):
         if self.busy:
-            self.toast("Tunggu, masih memuat…")
+            self.toast("Wait, still loading…")
             return
         self.busy = True
         self.spinner.start()
-        self.status.set_text("Memeriksa versi terbaru…" if network else "Membaca daftar aplikasi…")
+        self._set_status("Checking latest versions…" if network else "Reading installed apps…", "busy")
         threading.Thread(target=self._load, args=(network,), daemon=True).start()
 
     def _load(self, network):
@@ -347,21 +491,23 @@ class Window(Adw.ApplicationWindow):
         self.busy = False
         self.spinner.stop()
         if error:
-            self.status.set_text(f"Gagal: {error}")
-            self.toast(f"Gagal memuat: {error}")
+            self._set_status(f"Failed: {error}", "err")
+            self.toast(f"Could not load: {error}")
             return
         self.rows = rows
         keys = {self._key(r) for r in rows if r["has_update"] and r["upgrade"]}
         self.selected = {k: v for k, v in self.selected.items() if k in keys}
+        n = sum(1 for r in rows if r["has_update"])
+        self.page_updates.set_badge_number(n)
         self._sync_selection()
         self._rebuild(both=True)
         if network:
-            n = sum(1 for r in rows if r["has_update"])
-            self.status.set_text(
-                f"{len(rows)} aplikasi · {n} punya update" if n else f"{len(rows)} aplikasi · semua terbaru"
+            self._set_status(
+                f"{len(rows)} apps · {n} with an update" if n else f"{len(rows)} apps · all current",
+                "warn" if n else "ok",
             )
         else:
-            self.status.set_text(f"{len(rows)} aplikasi terpasang · klik ⟳ untuk memeriksa update")
+            self._set_status(f"{len(rows)} apps installed · check to compare versions", "busy")
 
     def _matches(self, page, r):
         if page == "updates" and not r["has_update"]:
@@ -384,9 +530,10 @@ class Window(Adw.ApplicationWindow):
 
         shown = [r for r in self.rows if self._matches(page, r)]
         shown.sort(key=lambda r: (not r["has_update"], r["source"], r["name"].lower()))
+        gutter = any(r["has_update"] and r["upgrade"] for r in shown)
         for data in shown:
             key = self._key(data)
-            row = Row(data, on_toggle=self._toggle_select, selected=key in self.selected)
+            row = Row(data, on_toggle=self._toggle_select, selected=key in self.selected, gutter=gutter)
             row.set_activatable(True)
             row.connect("activated", self._open_detail, data)
             if getattr(row, "update_button", None):
@@ -397,11 +544,14 @@ class Window(Adw.ApplicationWindow):
             stack.set_visible_child_name("list")
             return
         if page == "updates":
-            empty.set_title("Tidak ada update")
-            empty.set_description("Semua aplikasi sudah versi terbaru.")
+            empty.set_icon_name("emblem-ok-symbolic")
+            empty.set_title("No updates")
+            empty.set_description("Every app is already current." if not self.search.get_text().strip()
+                                  else "No updates match this search.")
         else:
-            empty.set_title("Tidak ada hasil")
-            empty.set_description("Coba kata kunci lain.")
+            empty.set_icon_name("system-search-symbolic")
+            empty.set_title("No results")
+            empty.set_description("Try another search.")
         stack.set_visible_child_name("empty")
 
     # ---------------------------------------------------------------- pilihan
@@ -424,7 +574,8 @@ class Window(Adw.ApplicationWindow):
             return
         n = len(self.selected)
         btn.set_visible(bool(n))
-        btn.set_label(f"Update {n} terpilih" if n != 1 else "Update 1 terpilih")
+        word = "Update 1 selected" if n == 1 else f"Update {n} selected"
+        btn._upd_label.set_label(word)
         btn.set_sensitive(bool(n) and not self.busy)
 
     def _select_all(self, *_):
@@ -443,15 +594,15 @@ class Window(Adw.ApplicationWindow):
     def _confirm_update_selected(self, *_):
         todo = list(self.selected.values())
         if not todo:
-            self.toast("Belum ada yang dipilih")
+            self.toast("Nothing selected yet")
             return
         dlg = Adw.AlertDialog(
-            heading=f"Update {len(todo)} aplikasi terpilih?",
+            heading=f"Update {len(todo)} selected apps?",
             body=", ".join(r["name"] for r in todo[:6])
                  + ("…" if len(todo) > 6 else "")
-                 + "\n\nPerintah dijalankan satu per satu. Binary sistem butuh sudo tanpa password.",
+                 + "\n\nCommands run one at a time. System binaries need passwordless sudo.",
         )
-        dlg.add_response("cancel", "Batal")
+        dlg.add_response("cancel", "Cancel")
         dlg.add_response("ok", "Update")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.connect("response", lambda d, resp: self._update_selected(todo) if resp == "ok" else None)
@@ -481,17 +632,19 @@ class Window(Adw.ApplicationWindow):
 
     def start_update(self, data, button=None):
         if self.busy:
-            self.toast("Tunggu, masih ada proses lain")
+            self.toast("Wait, another job is still running")
             return
         self.busy = True
         if button is not None:
             button.set_sensitive(False)
-            button.set_label("…")
-        self.status.set_text(f"Memperbarui {data['name']}…")
+            if getattr(button, "_upd_label", None):
+                button._upd_label.set_label("…")
+        self._set_status(f"Updating {data['name']}…", "busy")
+        self.spinner.start()
         threading.Thread(target=self._run_one, args=(data,), daemon=True).start()
 
     def after_remove(self, name, ok, msg):
-        self.toast(f"{name}: {'dihapus' if ok else 'gagal — ' + msg}")
+        self.toast(f"{name}: {'removed' if ok else 'failed — ' + msg}")
         self.reload(network=True)
 
     def _run_one(self, data):
@@ -503,20 +656,21 @@ class Window(Adw.ApplicationWindow):
         GLib.idle_add(self._after_one, data, ok, msg)
 
     def _after_one(self, data, ok, msg):
-        self.toast(f"{data['name']}: {'berhasil' if ok else 'gagal — ' + msg}")
+        self.toast(f"{data['name']}: {'done' if ok else 'failed — ' + msg}")
         self.busy = False
+        self.spinner.stop()
         self.reload(network=True)
 
     def _confirm_update_all(self, *_):
         todo = [r for r in self.rows if r["has_update"] and r["upgrade"]]
         if not todo:
-            self.toast("Tidak ada update otomatis")
+            self.toast("No automatic updates")
             return
         dlg = Adw.AlertDialog(
-            heading=f"Update {len(todo)} aplikasi?",
-            body="Perintah dijalankan satu per satu. Binary sistem butuh sudo tanpa password.",
+            heading=f"Update {len(todo)} apps?",
+            body="Commands run one at a time. System binaries need passwordless sudo.",
         )
-        dlg.add_response("cancel", "Batal")
+        dlg.add_response("cancel", "Cancel")
         dlg.add_response("ok", "Update")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.connect("response", lambda d, resp: self._update_all(todo) if resp == "ok" else None)
@@ -532,7 +686,7 @@ class Window(Adw.ApplicationWindow):
     def _run_all(self, todo):
         ok_count = 0
         for i, data in enumerate(todo, 1):
-            GLib.idle_add(self.status.set_text, f"({i}/{len(todo)}) {data['name']}…")
+            GLib.idle_add(self._set_status, f"({i}/{len(todo)}) {data['name']}…", "busy")
             if self._run_one_sync(data):
                 ok_count += 1
         GLib.idle_add(self._after_all, ok_count, len(todo))
@@ -544,7 +698,7 @@ class Window(Adw.ApplicationWindow):
     def _after_all(self, ok_count, total):
         self.busy = False
         self.spinner.stop()
-        self.toast(f"{ok_count}/{total} update dijalankan")
+        self.toast(f"{ok_count}/{total} updates ran")
         self.reload(network=True)
 
     def _clean(self, *_):
@@ -554,19 +708,19 @@ class Window(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _after_clean(self, removed):
-        self.toast(f"{len(removed)} entri launcher dibersihkan" if removed else "Tidak ada launcher yatim")
+        self.toast(f"{len(removed)} launcher entries cleaned" if removed else "No orphaned launchers")
 
     def _clean_stale(self, *_):
         items = upd.stale_items()
         if not items:
-            self.toast("Tidak ada sisa versi lama")
+            self.toast("No old versions left")
             return
         dlg = Adw.AlertDialog(
-            heading=f"Bersihkan {len(items)} sisa versi lama?",
-            body="Semua dipindah ke Trash, jadi masih bisa dikembalikan.",
+            heading=f"Clean {len(items)} old versions?",
+            body="Everything moves to Trash, so you can restore it.",
         )
-        dlg.add_response("cancel", "Batal")
-        dlg.add_response("ok", "Bersihkan")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Clean")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
 
         def run(_dlg, resp):
@@ -582,7 +736,7 @@ class Window(Adw.ApplicationWindow):
         dlg.present(self)
 
     def _after_stale(self, count):
-        self.toast(f"{count} sisa versi lama dipindah ke Trash")
+        self.toast(f"{count} old versions moved to Trash")
         self.reload(network=True)
 
     def _about(self, *_):
@@ -591,7 +745,7 @@ class Window(Adw.ApplicationWindow):
             application_icon=APP_ID,
             developer_name="Azmi Farih",
             version="1.0",
-            comments="Kelola aplikasi yang tidak diinstall lewat apt atau snap.",
+            comments="Manage apps that were not installed with apt or snap.",
         )
         about.present(self)
 
