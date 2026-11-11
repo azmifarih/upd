@@ -40,13 +40,37 @@ Source icons live in `icons/hicolor/` and are loaded from that folder.
 
 ## Install
 
+One command, for your own user account:
+
 ```bash
-ln -sf "$PWD/upd.py" ~/.local/bin/upd
-ln -sf "$PWD/upd_gui.py" ~/.local/bin/upd-gui
-chmod +x upd.py upd_gui.py
+curl -fsSL https://raw.githubusercontent.com/azmifarih/upd/main/install.sh | sh
 ```
 
-The CLI needs only `python3`. The GUI also needs PyGObject, GTK4, and libadwaita.
+Or from a clone:
+
+```bash
+git clone https://github.com/azmifarih/upd.git
+cd upd
+./install.sh
+```
+
+That copies upd to `~/.local` and adds the **upd** app. Open a new terminal if
+`upd` is not found yet, then run `upd` or `upd-gui`.
+
+```bash
+./install.sh --prefix /usr/local   # system-wide; needs permission to write there
+./install.sh --uninstall           # remove the install under the same prefix
+```
+
+The CLI needs `python3` 3.9 or newer. The window needs PyGObject, GTK4, and
+libadwaita from the distro. On Debian or Ubuntu:
+
+```bash
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+```
+
+If `python3` in the shell is a virtualenv without GTK, `upd-gui` still uses
+`/usr/bin/python3`.
 
 ## Use
 
