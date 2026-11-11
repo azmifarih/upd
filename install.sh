@@ -153,6 +153,8 @@ write_launcher() {
   target=$3
   dest=$prefix/bin/$name
   mkdir -p "$prefix/bin"
+  # Remove a previous launcher. rm deletes a symlink itself, not the file it points at.
+  rm -f "$dest"
   qpy=$(shell_quote "$python")
   qtarget=$(shell_quote "$target")
   cat > "$dest" <<EOF
