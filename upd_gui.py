@@ -103,7 +103,7 @@ class Row(Adw.ActionRow):
         super().__init__(title=escape(data["name"]))
         src = data["source"]
         cur, latest = str(data["current"]), str(data["latest"])
-        if data["has_update"] and latest not in ("?", cur):
+        if data["has_update"] and data["upgrade"] and latest not in ("?", cur):
             subtitle = f"{cur}  →  {latest}    ·    {src}"
         else:
             subtitle = f"{cur}    ·    {src}"
@@ -135,16 +135,6 @@ class Row(Adw.ActionRow):
             btn.set_valign(Gtk.Align.CENTER)
             self.add_suffix(btn)
             self.update_button = btn
-        elif data["has_update"]:
-            hint = Gtk.Box(spacing=6)
-            hint.set_valign(Gtk.Align.CENTER)
-            mark = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
-            mark.set_pixel_size(16)
-            mark.add_css_class("warn-mark")
-            hint.append(mark)
-            hint.append(label("Manual", "dim-label"))
-            hint.set_tooltip_text("A newer version exists, but there is no automatic update")
-            self.add_suffix(hint)
 
 
 REMOVABLE = {"npm", "bun", "pipx", "uv", "cargo", "flatpak", "appimage", "manual"}
@@ -175,7 +165,7 @@ class DetailDialog(Adw.Dialog):
         name.set_wrap(True)
         name.set_selectable(True)
         cur, latest = str(data["current"]), str(data["latest"])
-        if data["has_update"] and latest not in ("?", cur):
+        if data["has_update"] and data["upgrade"] and latest not in ("?", cur):
             version = f"{cur}  →  {latest}"
         else:
             version = cur
@@ -195,8 +185,6 @@ class DetailDialog(Adw.Dialog):
         if data.get("upgrade"):
             facts.append(self._fact("How to update", upd.describe_upgrade(data["upgrade"]),
                                    "software-update-available-symbolic"))
-        elif data["has_update"]:
-            facts.append(self._fact("How to update", "No automatic path yet", "dialog-warning-symbolic"))
         if data.get("url"):
             link = self._fact("Release page", str(data["url"]), "web-browser-symbolic")
             link.set_activatable(True)
@@ -220,8 +208,6 @@ class DetailDialog(Adw.Dialog):
                               "pill", "suggested-action")
             btn.connect("clicked", self._on_update)
             actions.append(btn)
-        elif data["has_update"]:
-            actions.append(label("Update is manual", "dim-label"))
         box.append(actions)
 
         view.set_content(box)
@@ -497,7 +483,7 @@ class Window(Adw.ApplicationWindow):
         self.rows = rows
         keys = {self._key(r) for r in rows if r["has_update"] and r["upgrade"]}
         self.selected = {k: v for k, v in self.selected.items() if k in keys}
-        n = sum(1 for r in rows if r["has_update"])
+        n = sum(1 for r in rows if r["has_update"] and r["upgrade"])
         self.page_updates.set_badge_number(n)
         self._sync_selection()
         self._rebuild(both=True)
@@ -510,7 +496,7 @@ class Window(Adw.ApplicationWindow):
             self._set_status(f"{len(rows)} apps installed · check to compare versions", "busy")
 
     def _matches(self, page, r):
-        if page == "updates" and not r["has_update"]:
+        if page == "updates" and not (r["has_update"] and r["upgrade"]):
             return False
         q = self.search.get_text().strip().lower()
         return not q or q in r["name"].lower() or q in r["source"]
@@ -529,7 +515,7 @@ class Window(Adw.ApplicationWindow):
             child = nxt
 
         shown = [r for r in self.rows if self._matches(page, r)]
-        shown.sort(key=lambda r: (not r["has_update"], r["source"], r["name"].lower()))
+        shown.sort(key=lambda r: (not (r["has_update"] and r["upgrade"]), r["source"], r["name"].lower()))
         gutter = any(r["has_update"] and r["upgrade"] for r in shown)
         for data in shown:
             key = self._key(data)

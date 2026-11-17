@@ -53,6 +53,36 @@ def real_home():
 
 
 HOME = real_home()
+
+
+def prefer_nvm_node():
+    """Desktop sessions do not load nvm. Use the default nvm Node so global npm matches the terminal."""
+    nvm = Path(os.environ.get("NVM_DIR") or (HOME / ".nvm"))
+    version = ""
+    try:
+        version = (nvm / "alias" / "default").read_text().strip()
+    except OSError:
+        version = ""
+    bin_dir = None
+    if version:
+        cand = nvm / "versions" / "node" / f"v{version.lstrip('v')}" / "bin"
+        if (cand / "npm").is_file():
+            bin_dir = cand
+    if bin_dir is None:
+        root = nvm / "versions" / "node"
+        if root.is_dir():
+            cands = sorted(p for p in root.glob("v*") if (p / "bin" / "npm").is_file())
+            if cands:
+                bin_dir = cands[-1] / "bin"
+    if bin_dir is None:
+        return
+    bin_s = str(bin_dir)
+    parts = [p for p in os.environ.get("PATH", "").split(":") if p and p != bin_s]
+    os.environ["PATH"] = ":".join([bin_s, *parts])
+
+
+prefer_nvm_node()
+
 CONFIG_DIR = Path(os.environ.get("UPD_CONFIG_DIR", HOME / ".config" / "upd"))
 CACHE_DIR = Path(os.environ.get("UPD_CACHE_DIR", HOME / ".cache" / "upd"))
 APPIMAGE_MAP = CONFIG_DIR / "appimages.json"
@@ -2085,10 +2115,10 @@ def collect(only=None, with_latest=True):
             for it in other_npm:
                 futs[("other", it["name"])] = http.submit(npm_latest, it["name"])
         latest = _await_map(futs)
+        npm_exe = shutil.which("npm") or "npm"
         for it in items:
             out.append(_row("npm", it["name"], it["current"], latest.get(("user", it["name"])),
-                            upgrade=["npm", "install", "-g", f"{it['name']}@latest"]))
-        npm_exe = shutil.which("npm") or "npm"
+                            upgrade=[npm_exe, "install", "-g", f"{it['name']}@latest"]))
         for it in other_npm:
             root = Path(it["prefix"]) / "lib" / "node_modules"
             cmd = [npm_exe, "install", "-g", "--prefix", it["prefix"], f"{it['name']}@latest"]
@@ -2217,6 +2247,11 @@ def collect(only=None, with_latest=True):
                 up = list(it["upgrade"])
                 if up[:1] == ["__ollama__"]:
                     up = ["__ollama__", got] if got else []
+                elif (not up and got and it.get("repo") and it.get("path")
+                      and it["repo"] not in NO_BINARY_REPOS):
+                    target = expand_path(it["path"])
+                    if target.parent.is_dir() and (os.access(target.parent, os.W_OK) or sudo_available()):
+                        up = ["__gh__", it["repo"], str(got), str(target)]
                 out.append(_row("script", it["name"], it["current"], got,
                                 upgrade=up, note=note, url=url,
                                 target=it.get("path") or "", repo=it.get("repo") or ""))
@@ -2335,7 +2370,7 @@ def summarize(rows):
     out = [r for r in rows if r["has_update"]]
     unknown = [r for r in rows if r["latest"] == "?"]
     print()
-    print(f"{len(rows)} apps tracked, {BOLD}{len(out)}{RESET} with an update" +
+    print(f"{len(rows)} apps checked, {BOLD}{len(out)}{RESET} with an update" +
           (f", {len(unknown)} latest versions unknown" if unknown else ""))
     if out:
         print(f"Run: {BOLD}upd update{RESET} to install them")
@@ -2468,20 +2503,33 @@ def cmd_scan(args):
     only = args.only.split(",") if args.only else None
     rows = collect(only)
     if args.outdated:
-        rows = [r for r in rows if r["has_update"]]
+        shown = [r for r in rows if r["has_update"] and r["upgrade"]]
+    else:
+        shown = rows
     if args.json:
-        print(json.dumps({"count": len(rows), "rows": rows}, indent=2))
+        payload = {"count": len(shown), "rows": shown}
+        if args.outdated:
+            payload["checked"] = len(rows)
+        print(json.dumps(payload, indent=2))
         return 0
-    print_table(rows)
-    summarize(rows)
-    manual = [r for r in rows if r["has_update"] and not r["upgrade"] and r["note"]]
+    if args.outdated and not shown:
+        print(f"No updates. {len(rows)} apps checked.")
+        return 0
+    print_table(shown)
+    if args.outdated:
+        print()
+        print(f"{len(rows)} apps checked, {BOLD}{len(shown)}{RESET} with an update")
+        print(f"Run: {BOLD}upd update{RESET} to install them")
+    else:
+        summarize(shown)
+    manual = [r for r in shown if r["has_update"] and not r["upgrade"] and r["note"]]
     if manual:
         print(f"\n{DIM}Needs a manual step:{RESET}")
         for r in manual:
             print(f"  - {r['source']}:{r['name']}  {r['current']} -> {r['latest']}  {DIM}{r['note']}{RESET}")
             if r.get("url"):
                 print(f"    {DIM}{r['url']}{RESET}")
-    if any(r["source"] == "appimage" and r["note"].startswith("no updater metadata") for r in rows):
+    if any(r["source"] == "appimage" and r["note"].startswith("no updater metadata") for r in shown):
         print(f"{DIM}AppImage with no updater metadata: `upd appimage map FILE OWNER/REPO`{RESET}")
     return 0
 
